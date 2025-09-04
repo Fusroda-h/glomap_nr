@@ -17,6 +17,8 @@ struct GlobalPositionerOptions : public OptimizationBaseOptions {
     POINTS_AND_CAMERAS_BALANCED,
     // treat each contribution from camera to point and camera to camera equally
     POINTS_AND_CAMERAS,
+    // only include camera to point constraints but calculating with scaled relpose translation
+    ONLY_SCALEDPOINTS,
   };
 
   // Whether initialize the reconstruction randomly
@@ -73,17 +75,38 @@ class GlobalPositioner {
   void AddCameraToCameraConstraints(const ViewGraph& view_graph,
                                     std::unordered_map<image_t, Image>& images);
 
-  // Add tracks to the problem
+  // // Add tracks to the problem
+  // void AddPointToCameraConstraints(
+  //     std::unordered_map<camera_t, Camera>& cameras,
+  //     std::unordered_map<image_t, Image>& images,
+  //     std::unordered_map<track_t, Track>& tracks);
+
+  // Add tracks to the problem (point-to-camera constraints).
+  // We thread view_graph so ONLY_SCALEDPOINTS can prebuild fixed world directions.
   void AddPointToCameraConstraints(
       std::unordered_map<camera_t, Camera>& cameras,
       std::unordered_map<image_t, Image>& images,
-      std::unordered_map<track_t, Track>& tracks);
+      std::unordered_map<track_t, Track>& tracks,
+      const ViewGraph& view_graph);
 
   // Add a single track to the problem
   void AddTrackToProblem(track_t track_id,
                          std::unordered_map<camera_t, Camera>& cameras,
                          std::unordered_map<image_t, Image>& images,
                          std::unordered_map<track_t, Track>& tracks);
+
+  // Add a single track to the problem (ONLY_SCALEDPOINTS path).
+  // Uses 1-DOF scalar s per camera along a fixed world direction.
+  void AddTrackToScaledCamProblem(
+      track_t track_id,
+      std::unordered_map<camera_t, Camera>& cameras,
+      std::unordered_map<image_t, Image>& images,
+      std::unordered_map<track_t, Track>& tracks);
+  
+  void BuildScaledCamDirectionsTree(
+    const ViewGraph& view_graph,
+    const std::unordered_map<image_t, Image>& images,
+    image_t root_id);
 
   // Set the parameter groups
   void AddCamerasAndPointsToParameterGroups(
@@ -109,6 +132,16 @@ class GlobalPositioner {
 
   // Auxiliary scale variables.
   std::vector<double> scales_;
+
+  // === ONLY_SCALEDPOINTS state ===
+  // global fixed root center for all cameras (default: (0,0,0))
+  Eigen::Vector3d c_root_fixed_ = Eigen::Vector3d::Zero();
+  // per-camera 1-DOF scalars
+  std::vector<double> s_vars_;
+  // Map image_id -> index into s_vars_.
+  std::unordered_map<image_t, size_t> s_index_;
+  // per-camera fixed world directions (stable storage for .data() if needed elsewhere)
+  std::unordered_map<image_t, Eigen::Vector3d> dir_param_holder_;
 };
 
 }  // namespace glomap

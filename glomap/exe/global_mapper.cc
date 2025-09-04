@@ -26,7 +26,7 @@ int RunMapper(int argc, char** argv) {
   options.AddDefaultOption("constraint_type",
                            &constraint_type,
                            "{ONLY_POINTS, ONLY_CAMERAS, "
-                           "POINTS_AND_CAMERAS_BALANCED, POINTS_AND_CAMERAS}");
+                           "POINTS_AND_CAMERAS_BALANCED, POINTS_AND_CAMERAS, ONLY_SCALEDPOINTS}");
   options.AddDefaultOption("output_format", &output_format, "{bin, txt}");
   options.AddGlobalMapperFullOptions();
 
@@ -49,6 +49,9 @@ int RunMapper(int argc, char** argv) {
   } else if (constraint_type == "POINTS_AND_CAMERAS") {
     options.mapper->opt_gp.constraint_type =
         GlobalPositionerOptions::POINTS_AND_CAMERAS;
+  } else if (constraint_type == "ONLY_SCALEDPOINTS") {
+    options.mapper->opt_gp.constraint_type =
+        GlobalPositionerOptions::ONLY_SCALEDPOINTS;
   } else {
     LOG(ERROR) << "Invalid constriant type";
     return EXIT_FAILURE;
