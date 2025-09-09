@@ -104,9 +104,20 @@ class GlobalPositioner {
       std::unordered_map<track_t, Track>& tracks);
   
   void BuildScaledCamDirectionsTree(
-    const ViewGraph& view_graph,
-    const std::unordered_map<image_t, Image>& images,
-    image_t root_id);
+      const ViewGraph& view_graph,
+      const std::unordered_map<image_t, Image>& images,
+      image_t root_id);
+
+  void InitScalesByMST_FromViewGraphMatches(
+      const ViewGraph& view_graph,
+      const std::unordered_map<image_t, Image>& images,
+      const std::unordered_map<track_t, Track>& tracks,
+      image_t root_id);
+
+  void DumpInitScalesCSV(
+      const std::unordered_map<camera_t, Camera>& cameras,
+      const std::unordered_map<image_t, Image>& images,
+      const std::string& csv_path) const;
 
   // Set the parameter groups
   void AddCamerasAndPointsToParameterGroups(
