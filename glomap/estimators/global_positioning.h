@@ -119,6 +119,8 @@ class GlobalPositioner {
       const std::unordered_map<image_t, Image>& images,
       const std::string& csv_path) const;
 
+  void EnforceOutwardDirs(const std::unordered_map<image_t, Image>& images);
+
   // Set the parameter groups
   void AddCamerasAndPointsToParameterGroups(
       std::unordered_map<image_t, Image>& images,

@@ -655,12 +655,12 @@ void GlobalPositioner::AddPointToCameraConstraints(
     // (If your ImagePair uses a different field than `num_inlier_matches`, rename there.)
     InitScalesByMST_FromViewGraphMatches(view_graph, images, tracks, root_id);
 
-    DumpInitScalesCSV(cameras, images, "init_scales.csv");
-
     // 2) set global root center (choose one policy)
     // simplest: center
     c_root_fixed_ = images.at(root_id).Center();
     // 3) preallocate s_i with stable addresses, init to 1.0
+
+    EnforceOutwardDirs(images);
 
     // Uniform 1 scale setting
     // s_vars_.clear();
@@ -672,11 +672,10 @@ void GlobalPositioner::AddPointToCameraConstraints(
     // for (auto &v : s_vars_){
     //   v = 100.0 * RandomDouble(random_generator_, -1, 1);
     // }
-    {
-      size_t idx = 0;
-      for (const auto& [image_id, image] : images) {
-        s_index_[image_id] = idx++;
-      }
+
+    size_t idx = 0;
+    for (const auto& [image_id, image] : images) {
+      s_index_[image_id] = idx++;
     }
     // 4) add residuals
     for (auto& [track_id, track] : tracks) {
@@ -688,8 +687,38 @@ void GlobalPositioner::AddPointToCameraConstraints(
       }
       AddTrackToScaledCamProblem(track_id, cameras, images, tracks);
     }
+
+    DumpInitScalesCSV(cameras, images, "init_scales.csv");
   }
 }
+
+void GlobalPositioner::EnforceOutwardDirs(const std::unordered_map<image_t, Image>& images) {
+  if (s_index_.empty()) return;
+
+  const Eigen::Vector3d Croot = c_root_fixed_;
+  int flipped = 0;
+
+  for (const auto& [img_id, img] : images) {
+    auto it_dir = dir_param_holder_.find(img_id);
+    auto it_si  = s_index_.find(img_id);
+    if (it_dir == dir_param_holder_.end() || it_si == s_index_.end()) continue;
+
+    Eigen::Vector3d& dir = it_dir->second;
+    double& s            = s_vars_[it_si->second];
+
+    // 현재 카메라 센터
+    const Eigen::Vector3d Ci = Croot + s * dir;
+
+    // 바깥(=Croot에서 Ci로 향하는 벡터)과 dir의 내적이 음수면 뒤집기
+    if ((Ci - Croot).dot(dir) < 0.0) {
+      dir = -dir;
+      s   = -s;
+      ++flipped;
+    }
+  }
+  LOG(INFO) << "[Init] Outward dir enforcement flipped " << flipped << " cameras.";
+}
+
 
 void GlobalPositioner::AddTrackToScaledCamProblem(
     track_t track_id,
@@ -795,87 +824,6 @@ void GlobalPositioner::BuildScaledCamDirectionsTree(
   //   heuristic here, but keep it optional and avoid global sign forcing.
 }
 
-
-// void GlobalPositioner::BuildScaledCamDirectionsTree(
-//     const ViewGraph& view_graph,
-//     const std::unordered_map<image_t, Image>& images,
-//     image_t root_id) {
-//   // (1) Build adjacency list from valid image pairs
-//   std::unordered_map<image_t, std::vector<image_t>> adj;
-//   for (const auto& [pair_id, p] : view_graph.image_pairs) {
-//     if (!p.is_valid) continue;
-//     if (!images.count(p.image_id1) || !images.count(p.image_id2)) continue;
-//     adj[p.image_id1].push_back(p.image_id2);
-//     adj[p.image_id2].push_back(p.image_id1);
-//   }
-
-//   // (2) BFS traversal from the root to assign parent relationships
-//   std::unordered_map<image_t, image_t> parent;
-//   std::queue<image_t> q;
-//   parent[root_id] = root_id;  // root is its own parent
-//   q.push(root_id);
-
-//   while (!q.empty()) {
-//     image_t u = q.front(); q.pop();
-//     if (!adj.count(u)) continue;
-//     for (image_t v : adj[u]) {
-//       if (parent.find(v) != parent.end()) continue;  // already visited
-//       parent[v] = u;
-//       q.push(v);
-//     }
-//   }
-
-//   // (3) For each node, assign dir_i as the world direction of parent->i edge
-//   dir_param_holder_.clear();
-
-//   for (const auto& [i, img] : images) {
-//     if (i == root_id || parent.find(i) == parent.end()) {
-//       // Root or isolated node: assign arbitrary axis (X-axis)
-//       dir_param_holder_[i] = Eigen::Vector3d(1,0,0);
-//       continue;
-//     }
-//     image_t par = parent[i];
-
-//     // Compute world direction directly using the available pair orientation
-//     Eigen::Vector3d u_world;
-//     bool found = false;
-
-//     for (const auto& [pair_id, P] : view_graph.image_pairs) {
-//       if (!P.is_valid) continue;
-
-//       if (P.image_id1 == par && P.image_id2 == i) {
-//         // Case: par(cam1) -> i(cam2). t is in camera i frame.
-//         // u_world = -(R_i^T) * t_{i<-par}
-//         const Eigen::Matrix3d R_i_T   = images.at(i).cam_from_world.rotation.toRotationMatrix().transpose();
-
-
-//         u_world = -(R_i_T * P.cam2_from_cam1.translation);
-//         found = true;
-//         break;
-//       }
-//       if (P.image_id1 == i && P.image_id2 == par) {
-//         // Case: i(cam1) -> par(cam2). t is in camera par frame.
-//         // We want direction of (C_i - C_par) in world:
-//         // C_par - C_i ~ -(R_par^T) * t_{par<-i}  ->  C_i - C_par ~ +(R_par^T) * t_{par<-i}
-//         const Eigen::Matrix3d R_par_T = images.at(par).cam_from_world.rotation.toRotationMatrix().transpose();
-//         u_world = R_par_T * P.cam2_from_cam1.translation;
-//         found = true;
-//         break;
-//       }
-//     }
-
-//     if (!found) {
-//       // If no valid pair exists, fallback to arbitrary axis
-//       u_world = Eigen::Vector3d(1,0,0);
-//     } else {
-//       if (u_world.norm() > 1e-12) u_world.normalize();
-//       else u_world = Eigen::Vector3d(1,0,0);
-//     }
-
-//     dir_param_holder_[i] = u_world;
-//   }
-// }
-
 // GlobalPositioner 클래스 메서드로 추가
 void GlobalPositioner::DumpInitScalesCSV(
     const std::unordered_map<camera_t, Camera>& cameras,
@@ -958,15 +906,6 @@ void GlobalPositioner::InitScalesByMST_FromViewGraphMatches(
 
   // (2) Build MST
   auto parent = BuildMST_MaxWeight(adj, images, root_id);
-
-  // for (const auto& [pair_id, P] : view_graph.image_pairs) {
-  //   if (!P.is_valid) continue;
-  //   Eigen::Vector3d e_dir;
-  //   if (GetEdgeWorldDirection(view_graph, images, P.image_id1, P.image_id2, &e_dir)) {
-  //     auto& dv = dir_param_holder_[P.image_id2];
-  //     if (dv.dot(e_dir) < 0) dv = -dv; // align sign
-  //   }
-  // }
 
   // (3) Make children list
   std::unordered_map<image_t, std::vector<image_t>> children;
