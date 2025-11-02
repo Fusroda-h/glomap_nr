@@ -16,17 +16,21 @@ int RunMapper(int argc, char** argv) {
   std::string output_path;
 
   std::string image_path = "";
-  std::string constraint_type = "ONLY_POINTS";
+  // std::string constraint_type = "ONLY_POINTS";
+  // std::string center_init_mode = "RANDOM";
   std::string output_format = "bin";
 
   OptionManager options;
   options.AddRequiredOption("database_path", &database_path);
   options.AddRequiredOption("output_path", &output_path);
   options.AddDefaultOption("image_path", &image_path);
-  options.AddDefaultOption("constraint_type",
-                           &constraint_type,
-                           "{ONLY_POINTS, ONLY_CAMERAS, "
-                           "POINTS_AND_CAMERAS_BALANCED, POINTS_AND_CAMERAS, ONLY_SCALEDPOINTS}");
+  // options.AddDefaultOption("constraint_type",
+  //                          &constraint_type,
+  //                          "{ONLY_POINTS, ONLY_CAMERAS, "
+  //                          "POINTS_AND_CAMERAS_BALANCED, POINTS_AND_CAMERAS, ONLY_SCALEDPOINTS}");
+  // options.AddDefaultOption("center_init_mode",
+  //                          &center_init_mode,
+  //                          "{RANDOM, SCALED_FROM_S, S_ALPHA_LSQ}");
   options.AddDefaultOption("output_format", &output_format, "{bin, txt}");
   options.AddGlobalMapperFullOptions();
 
@@ -56,6 +60,63 @@ int RunMapper(int argc, char** argv) {
     LOG(ERROR) << "Invalid constriant type";
     return EXIT_FAILURE;
   }
+
+  // // center_init_mode: string -> enum (enum class)
+  // using CIM = GlobalPositionerOptions::CenterInitMode;
+  // if      (center_init_mode == "RANDOM")        {
+  //   options.mapper->opt_gp.center_init_mode = CIM::RANDOM;
+  // } else if (center_init_mode == "SCALED_FROM_S") {
+  //   options.mapper->opt_gp.center_init_mode = CIM::SCALED_FROM_S;
+  // } else if (center_init_mode == "S_ALPHA_LSQ")  {
+  //   options.mapper->opt_gp.center_init_mode = CIM::S_ALPHA_LSQ;
+  // } else {
+  //   LOG(ERROR) << "Invalid center_init_mode";
+  //   return EXIT_FAILURE;
+  // }
+
+  // Map GlobalPositioning.constraint_type (CLI int) -> enum
+  switch (options.mapper->opt_gp.constraint_type_cli) {
+    case 0: options.mapper->opt_gp.constraint_type = GlobalPositionerOptions::ONLY_POINTS; break;
+    case 1: options.mapper->opt_gp.constraint_type = GlobalPositionerOptions::ONLY_CAMERAS; break;
+    case 2: options.mapper->opt_gp.constraint_type = GlobalPositionerOptions::POINTS_AND_CAMERAS_BALANCED; break;
+    case 3: options.mapper->opt_gp.constraint_type = GlobalPositionerOptions::POINTS_AND_CAMERAS; break;
+    default:
+      LOG(ERROR) << "Invalid GlobalPositioning.constraint_type (expected 0~4)";
+      return EXIT_FAILURE;
+  }
+
+  // // Map GlobalPositioning.center_init_mode (CLI int) -> enum
+  // using CIM = GlobalPositionerOptions::CenterInitMode;
+  // switch (options.mapper->opt_gp.center_init_mode_cli) {
+  //   case 0: options.mapper->opt_gp.center_init_mode = CIM::RANDOM; break;
+  //   case 1: options.mapper->opt_gp.center_init_mode = CIM::SCALED_FROM_S; break;
+  //   case 2: options.mapper->opt_gp.center_init_mode = CIM::S_ALPHA_LSQ; break;
+  //   case 3: options.mapper->opt_gp.center_init_mode = CIM::TRI_RANSAC; break;
+  //   case 4: options.mapper->opt_gp.center_init_mode = CIM::LOAD_FROM_CSV; break;
+  //   default:
+  //     LOG(ERROR) << "Invalid GlobalPositioning.center_init_mode (expected 0~3)";
+  //     return EXIT_FAILURE;
+  // }
+
+  // using ECM = GlobalPositionerOptions::EdgeConsensusMetric;
+  // switch (options.mapper->opt_gp.edge_consensus_cli) {
+  //   case 0: options.mapper->opt_gp.edge_consensus_metric = ECM::ANGULAR; break;
+  //   case 1: options.mapper->opt_gp.edge_consensus_metric = ECM::PIXEL_REPROJ; break;
+  //   default:
+  //     LOG(ERROR) << "Invalid gp.edge_consensus (expected 0~1)";
+  //     return EXIT_FAILURE;
+  // }
+
+  // // Map GlobalPositionerOptions.tri_consensus_cli -> enum
+  // using TCM = GlobalPositionerOptions::TriConsensusMetric;
+  // switch (options.mapper->opt_gp.tri_consensus_cli) {
+  //   case 0: options.mapper->opt_gp.tri_consensus_metric = TCM::ANGULAR; break;
+  //   case 1: options.mapper->opt_gp.tri_consensus_metric = TCM::PIXEL_REPROJ; break;
+  //   case 2: options.mapper->opt_gp.tri_consensus_metric = TCM::SAMPSON; break;
+  //   default:
+  //     LOG(ERROR) << "Invalid gp.tri_consensus (expected 0~2)";
+  //     return EXIT_FAILURE;
+  // }
 
   // Check whether output_format is valid
   if (output_format != "bin" && output_format != "txt") {
