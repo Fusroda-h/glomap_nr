@@ -194,8 +194,8 @@ void OptionManager::AddGlobalPositionerOptions() {
 
   // DO NOT expose enum directly to Boost CLI (it cannot parse enum by default).
   // Keep it code-only. If you need CLI, add a string option and map it manually.
-  // AddAndRegisterDefaultOption("GlobalPositioning.constraint_type",
-  //                           &mapper->opt_gp.constraint_type);
+  AddAndRegisterDefaultOption("GlobalPositioning.constraint_type",
+                            &mapper->opt_gp.constraint_type_cli);
 
   // === New: initialization strategy & CSV dump ===
   // 0: RANDOM, 1: SCALED_TRIPLET
@@ -207,6 +207,7 @@ void OptionManager::AddGlobalPositionerOptions() {
                               &mapper->opt_gp.init_centers_csv_path);
 
   // Triplet-RANSAC specific options
+
   AddAndRegisterDefaultOption("GlobalPositioning.tri_ransac_max_iters",
                               &mapper->opt_gp.tri_ransac_max_iters);
   AddAndRegisterDefaultOption("GlobalPositioning.tri_min_inliers",

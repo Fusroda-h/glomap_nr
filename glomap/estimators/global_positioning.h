@@ -25,6 +25,13 @@ struct GlobalPositionerOptions : public OptimizationBaseOptions {
     POINTS_AND_CAMERAS,
   };
 
+  enum class CenterInitMode {
+    RANDOM = 0,
+    SCALED_TRIPLET = 1,
+    // ...
+  };
+  CenterInitMode center_init_mode = CenterInitMode::RANDOM;
+
   // Which consensus metric to use when running triplet RANSAC.
   // Must match the switch statement in global_positioning.cc.
   enum TriConsensusMetric {
@@ -32,6 +39,11 @@ struct GlobalPositionerOptions : public OptimizationBaseOptions {
     PIXEL_REPROJ = 1,
     SAMPSON = 2
   };
+
+  int constraint_type_cli = 0;
+  int center_init_mode_cli = 0;
+  bool dump_init_centers_csv = false;
+  std::string init_centers_csv_path;
 
   // ---------------------------------------------------------------------------
   // General options
@@ -71,22 +83,17 @@ struct GlobalPositionerOptions : public OptimizationBaseOptions {
   TriConsensusMetric tri_consensus_metric = PIXEL_REPROJ;
 
   // Maximum RANSAC iterations per triplet.
-  int tri_ransac_max_iters = 100;
-
+  int tri_ransac_max_iters = 200;
   // Minimum number of inliers for accepting a triplet model.
-  int tri_min_inliers = 8;
-
+  int tri_min_inliers = 10;
   // Maximum number of (i,j,k) triplets emitted per track.
-  int tri_max_triplets_per_track = 16;
-
+  int tri_max_triplets_per_track = 100;
   // Minimum depth during 3-view depth solve.
   double tri_min_depth = 1e-6;
-
   // Inlier threshold for ANGULAR metric (degrees, per view).
   double tri_inlier_ang_thresh_deg = 3.0;
-
   // Inlier threshold for PIXEL_REPROJ / SAMPSON (pixels, per pair/view).
-  double tri_inlier_px_thresh = 3.0;
+  double tri_inlier_px_thresh = 1.0;
 
   GlobalPositionerOptions() : OptimizationBaseOptions() {
     // Default robust loss for global positioning.
@@ -149,7 +156,7 @@ class GlobalPositioner {
   // Convert camera centers back to camera translations (cam_from_world).
   void ConvertResults(std::unordered_map<image_t, Image>& images);
 
-  void GlobalPositioner::DumpInitialCentersCSV(
+  void DumpInitialCentersCSV(
     const std::unordered_map<image_t, Image>& images,
     const std::string& csv_path) const;
 

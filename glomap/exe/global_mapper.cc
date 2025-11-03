@@ -29,6 +29,28 @@ int RunMapper(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
+  // Map GlobalPositioning.constraint_type (CLI int) -> enum
+  switch (options.mapper->opt_gp.constraint_type_cli) {
+    case 0: options.mapper->opt_gp.constraint_type = GlobalPositionerOptions::ONLY_POINTS; break;
+    case 1: options.mapper->opt_gp.constraint_type = GlobalPositionerOptions::ONLY_CAMERAS; break;
+    case 2: options.mapper->opt_gp.constraint_type = GlobalPositionerOptions::POINTS_AND_CAMERAS_BALANCED; break;
+    case 3: options.mapper->opt_gp.constraint_type = GlobalPositionerOptions::POINTS_AND_CAMERAS; break;
+    default:
+      LOG(ERROR) << "Invalid GlobalPositioning.constraint_type (expected 0~4)";
+      return EXIT_FAILURE;
+  }
+
+  // Map GlobalPositioning.center_init_mode (CLI int) -> enum
+  using CIM = GlobalPositionerOptions::CenterInitMode;
+  switch (options.mapper->opt_gp.center_init_mode_cli) {
+    case 0: options.mapper->opt_gp.center_init_mode = CIM::RANDOM; break;
+    case 1: options.mapper->opt_gp.center_init_mode = CIM::SCALED_TRIPLET; break;
+    // case 2: options.mapper->opt_gp.center_init_mode = CIM::LOAD_FROM_CSV; break;
+    default:
+      LOG(ERROR) << "Invalid GlobalPositioning.center_init_mode (expected 0~3)";
+      return EXIT_FAILURE;
+  }
+
   // At this point, options.mapper->opt_gp is already filled from CLI / default.
   // We do NOT do extra string-based mapping here anymore.
 

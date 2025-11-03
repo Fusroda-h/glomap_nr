@@ -4,6 +4,8 @@
 #include <numeric>
 #include <queue>
 #include <unordered_set>
+#include <fstream>
+#include <algorithm>  
 
 namespace glomap {
 namespace {
@@ -95,6 +97,12 @@ struct TripletKeyHash {
   }
 };
 
+struct EdgeScaleSample {
+  double s;          // scale 값
+  int inliers;       // 이 triplet 가설에서의 inlier 수
+  double median_err; // 이 triplet 가설의 median reproj error
+};
+
 
 }  // namespace
 
@@ -126,17 +134,21 @@ bool GlobalPositioner::Solve(const ViewGraph& view_graph,
     return false;
   }
 
-  LOG(INFO) << "Setting up the global positioner problem";
+  LOG(INFO) << "[GlobalPositioner] center_init_mode enum = "
+          << static_cast<int>(options_.center_init_mode);
 
   // If ONLY_POINTS: initialize cameras using triplet RANSAC from directions.
   switch (options_.center_init_mode) {
     case GlobalPositionerOptions::CenterInitMode::RANDOM: {
       // fallback to the original random initialization
+      LOG(INFO) << "[GlobalPositioner] CenterInitMode = RANDOM (0)";
       InitializeRandomPositions(view_graph, images, tracks);
+      
       break;
       }
     case GlobalPositionerOptions::CenterInitMode::SCALED_TRIPLET: {
-    std::unordered_map<uint64_t, std::vector<double>> edge_scales;
+      LOG(INFO) << "[GlobalPositioner] CenterInitMode = SCALED_TRIPLET (1)";
+      std::unordered_map<uint64_t, std::vector<double>> edge_scales;
       EstimateEdgeScalesByTriRansac(view_graph,
                                     images,
                                     tracks,
@@ -153,6 +165,7 @@ bool GlobalPositioner::Solve(const ViewGraph& view_graph,
   }
 
   // Setup ceres problem
+  LOG(INFO) << "Setting up the global positioner problem";
   SetupProblem(view_graph, tracks);
 
   // Add camera-to-camera constraints unless ONLY_POINTS.
@@ -466,11 +479,14 @@ void GlobalPositioner::DumpInitialCentersCSV(
     const std::unordered_map<image_t, Image>& images,
     const std::string& csv_path) const {
   std::ofstream csv(csv_path, std::ios::out);
+  if (!csv.is_open()) {
+    LOG(ERROR) << "Failed to open CSV file for writing: " << csv_path;
+    return;
+  }
+
   csv << "image_id,cx,cy,cz\n";
   for (const auto& [img_id, img] : images) {
-    auto it = init_centers_.find(img_id);
-    if (it == init_centers_.end()) continue;
-    const auto& C = it->second;
+    const Eigen::Vector3d C = img.cam_from_world.translation;
     csv << img_id << "," << C.x() << "," << C.y() << "," << C.z() << "\n";
   }
 }
@@ -542,7 +558,7 @@ bool GlobalPositioner::EstimateSForTripletRansac(
     // const Eigen::Vector3d dk = NormalizeSafe(images.at(k).features_undist[fk]);
 
     // ---- minimal solve for s = (s_ij, s_jk, s_ik) ----
-    // same structure as python: (Rjk*Rij - Rik) * di = s_ij * (Rjk*t_ij) + s_jk * t_jk - s_ik * t_ik
+    // (Rjk*Rij - Rik) * di = s_ij * (Rjk*t_ij) + s_jk * t_jk - s_ik * t_ik
     const Eigen::Vector3d B = (Rjk * Rij - Rik) * di;
     Eigen::Matrix3d A;
     A.col(0) = B.cross(Rjk * t_hat_ij);
@@ -847,6 +863,17 @@ void GlobalPositioner::InitializeCamerasFromTriScales(
   std::queue<image_t> q;
   q.push(root);
 
+  struct GoodEdge {
+    image_t v;
+    double s_uv;
+  };
+
+  std::unordered_map<image_t, std::vector<GoodEdge>> good_adj;
+
+  int num_edges_bfs       = 0;
+  int num_edges_with_scale = 0;
+  int num_edges_fallback   = 0;
+
   while (!q.empty()) {
     const image_t u = q.front();
     q.pop();
@@ -861,6 +888,8 @@ void GlobalPositioner::InitializeCamerasFromTriScales(
 
       if (visited.count(v)) continue;
 
+      ++num_edges_bfs;
+
       // get scale
       const uint64_t key = EdgeKey(u, v);
       double s_uv = 1.0;
@@ -872,6 +901,9 @@ void GlobalPositioner::InitializeCamerasFromTriScales(
                          buf.begin() + buf.size() / 2,
                          buf.end());
         s_uv = buf[buf.size() / 2];
+        ++num_edges_with_scale;
+      } else {
+        ++num_edges_fallback;   // s_uv = 1.0 fallback
       }
 
       // get direction in world
@@ -887,6 +919,15 @@ void GlobalPositioner::InitializeCamerasFromTriScales(
       q.push(v);
     }
   }
+
+  LOG(INFO) << "[TRI_RANSAC] BFS edges used = " << num_edges_bfs
+          << ", with_scale = " << num_edges_with_scale
+          << ", fallback_1.0 = " << num_edges_fallback
+          << ", ratio_with_scale = "
+          << (num_edges_bfs > 0
+                ? static_cast<double>(num_edges_with_scale) /
+                      static_cast<double>(num_edges_bfs)
+                : 0.0);
 
   LOG(INFO) << "[TRI_RANSAC] initialized " << visited.size()
             << " camera centers from triplet edge scales.";
