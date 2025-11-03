@@ -192,9 +192,34 @@ void OptionManager::AddGlobalPositionerOptions() {
       "GlobalPositioning.max_num_iterations",
       &mapper->opt_gp.solver_options.max_num_iterations);
 
-  // TODO: move the constrain type selection here
-  AddAndRegisterDefaultOption("GlobalPositioning.constraint_type",
-                            &mapper->opt_gp.constraint_type);
+  // DO NOT expose enum directly to Boost CLI (it cannot parse enum by default).
+  // Keep it code-only. If you need CLI, add a string option and map it manually.
+  // AddAndRegisterDefaultOption("GlobalPositioning.constraint_type",
+  //                           &mapper->opt_gp.constraint_type);
+
+  // === New: initialization strategy & CSV dump ===
+  // 0: RANDOM, 1: SCALED_TRIPLET
+  AddAndRegisterDefaultOption("GlobalPositioning.center_init_mode",
+                              &mapper->opt_gp.center_init_mode_cli);
+  AddAndRegisterDefaultOption("GlobalPositioning.dump_init_centers_csv",
+                              &mapper->opt_gp.dump_init_centers_csv);
+  AddAndRegisterDefaultOption("GlobalPositioning.init_centers_csv_path",
+                              &mapper->opt_gp.init_centers_csv_path);
+
+  // Triplet-RANSAC specific options
+  AddAndRegisterDefaultOption("GlobalPositioning.tri_ransac_max_iters",
+                              &mapper->opt_gp.tri_ransac_max_iters);
+  AddAndRegisterDefaultOption("GlobalPositioning.tri_min_inliers",
+                              &mapper->opt_gp.tri_min_inliers);
+  AddAndRegisterDefaultOption("GlobalPositioning.tri_max_triplets_per_track",
+                              &mapper->opt_gp.tri_max_triplets_per_track);
+  AddAndRegisterDefaultOption("GlobalPositioning.tri_min_depth",
+                              &mapper->opt_gp.tri_min_depth);
+  AddAndRegisterDefaultOption("GlobalPositioning.tri_inlier_ang_thresh_deg",
+                              &mapper->opt_gp.tri_inlier_ang_thresh_deg);
+  AddAndRegisterDefaultOption("GlobalPositioning.tri_inlier_px_thresh",
+                              &mapper->opt_gp.tri_inlier_px_thresh);
+}
 
   // // === New: initialization strategy & CSV dump ===
   // // 0: RANDOM, 1: SCALED_FROM_S, 2: S_ALPHA_LSQ
@@ -217,19 +242,19 @@ void OptionManager::AddGlobalPositionerOptions() {
 
   // AddAndRegisterDefaultOption("GlobalPositioning.tri_consensus",
   //                             &mapper->opt_gp.tri_consensus_cli);  // 0,1,2
-  AddAndRegisterDefaultOption("GlobalPositioning.tri_ransac_max_iters",
-                              &mapper->opt_gp.tri_ransac_max_iters);
-  AddAndRegisterDefaultOption("GlobalPositioning.tri_min_inliers",
-                              &mapper->opt_gp.tri_min_inliers);
-  AddAndRegisterDefaultOption("GlobalPositioning.tri_max_triplets_per_track",
-                              &mapper->opt_gp.tri_max_triplets_per_track);
+  // AddAndRegisterDefaultOption("GlobalPositioning.tri_ransac_max_iters",
+  //                             &mapper->opt_gp.tri_ransac_max_iters);
+  // AddAndRegisterDefaultOption("GlobalPositioning.tri_min_inliers",
+  //                             &mapper->opt_gp.tri_min_inliers);
+  // AddAndRegisterDefaultOption("GlobalPositioning.tri_max_triplets_per_track",
+  //                             &mapper->opt_gp.tri_max_triplets_per_track);
   // AddAndRegisterDefaultOption("GlobalPositioning.tri_min_depth",
   //                             &mapper->opt_gp.tri_min_depth);
   // AddAndRegisterDefaultOption("GlobalPositioning.tri_inlier_ang_thresh_deg",
   //                             &mapper->opt_gp.tri_inlier_ang_thresh_deg);
   // AddAndRegisterDefaultOption("GlobalPositioning.tri_inlier_px_thresh",
   //                             &mapper->opt_gp.tri_inlier_px_thresh);
-}
+
 void OptionManager::AddBundleAdjusterOptions() {
   if (added_bundle_adjustment_options_) {
     return;
