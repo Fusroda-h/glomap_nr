@@ -97,13 +97,6 @@ struct TripletKeyHash {
   }
 };
 
-struct EdgeScaleSample {
-  double s;          // scale 값
-  int inliers;       // 이 triplet 가설에서의 inlier 수
-  double median_err; // 이 triplet 가설의 median reproj error
-};
-
-
 }  // namespace
 
 // ------------------------------------------------------------------
@@ -148,7 +141,7 @@ bool GlobalPositioner::Solve(const ViewGraph& view_graph,
       }
     case GlobalPositionerOptions::CenterInitMode::SCALED_TRIPLET: {
       LOG(INFO) << "[GlobalPositioner] CenterInitMode = SCALED_TRIPLET (1)";
-      std::unordered_map<uint64_t, std::vector<double>> edge_scales;
+      std::unordered_map<uint64_t, std::vector<EdgeScaleSample>> edge_scales;
       EstimateEdgeScalesByTriRansac(view_graph,
                                     images,
                                     tracks,
@@ -501,7 +494,14 @@ bool GlobalPositioner::EstimateSForTripletRansac(
     const std::unordered_map<image_t, Image>& images,
     const std::unordered_map<track_t, Track>& tracks,
     const std::unordered_map<camera_t, Camera>& cameras,
-    Eigen::Vector3d* s_out) {
+    Eigen::Vector3d* s_out,
+    int* best_inliers_out,
+    double* median_err_out,
+    std::vector<Eigen::Matrix3d>* A_list_out) {
+
+  if (A_list_out) {
+    A_list_out->clear();
+  }
 
   // 1) get relative poses i->j, j->k, i->k
   Eigen::Matrix3d Rij, Rjk, Rik;
@@ -541,10 +541,9 @@ bool GlobalPositioner::EstimateSForTripletRansac(
   // RANSAC: sample 1 triplet-point, solve s, score on all 3-view tracks
   for (int it = 0; it < max_iters; ++it) {
     if (tids.empty()) break;
-    // sample 1 three-view track
+
     const track_t t0 = tids[it % tids.size()];
 
-    // we must have observation in i,j,k
     const int fi = FindObs(tracks.at(t0), i);
     const int fj = FindObs(tracks.at(t0), j);
     const int fk = FindObs(tracks.at(t0), k);
@@ -552,10 +551,8 @@ bool GlobalPositioner::EstimateSForTripletRansac(
       continue;
     }
 
-    // direction in each cam
+    // direction in cam-i for the minimal sample
     const Eigen::Vector3d di = NormalizeSafe(images.at(i).features_undist[fi]);
-    // const Eigen::Vector3d dj = NormalizeSafe(images.at(j).features_undist[fj]);
-    // const Eigen::Vector3d dk = NormalizeSafe(images.at(k).features_undist[fk]);
 
     // ---- minimal solve for s = (s_ij, s_jk, s_ik) ----
     // (Rjk*Rij - Rik) * di = s_ij * (Rjk*t_ij) + s_jk * t_jk - s_ik * t_ik
@@ -565,13 +562,12 @@ bool GlobalPositioner::EstimateSForTripletRansac(
     A.col(1) = B.cross(t_hat_jk);
     A.col(2) = B.cross(-t_hat_ik);
 
-    Eigen::JacobiSVD<Eigen::Matrix3d> svd(
-        A, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(A, Eigen::ComputeFullU | Eigen::ComputeFullV);
     Eigen::Vector3d s = svd.matrixV().col(2);
     if (!s.allFinite() || s.norm() < 1e-12) {
       continue;
     }
-    s.normalize();  // scale is up-to-scale anyway
+    // s.normalize();  // scale is up-to-scale anyway
 
     // ---- score this hypothesis on all tracks that see i,j,k ----
     int inl = 0;
@@ -589,7 +585,6 @@ bool GlobalPositioner::EstimateSForTripletRansac(
       const Eigen::Vector3d dj2 = NormalizeSafe(images.at(j).features_undist[fj2]);
       const Eigen::Vector3d dk2 = NormalizeSafe(images.at(k).features_undist[fk2]);
 
-      // scale the relative translations with this hypothesis
       const Eigen::Vector3d tij = s(0) * t_hat_ij;
       const Eigen::Vector3d tjk = s(1) * t_hat_jk;
       const Eigen::Vector3d tik = s(2) * t_hat_ik;
@@ -614,8 +609,7 @@ bool GlobalPositioner::EstimateSForTripletRansac(
       A9.block<3,1>(6,2) =  dk2;
       b9.segment<3>(6)   =  tik;
 
-      Eigen::Vector3d lambda =
-          A9.colPivHouseholderQr().solve(b9);
+      Eigen::Vector3d lambda = A9.colPivHouseholderQr().solve(b9);
       if (!lambda.allFinite()) continue;
       if (lambda(0) <= min_depth ||
           lambda(1) <= min_depth ||
@@ -623,7 +617,6 @@ bool GlobalPositioner::EstimateSForTripletRansac(
         continue;
       }
 
-      // reconstruct 3D point in each cam
       const Eigen::Vector3d Xi = lambda(0) * di2;       // cam-i
       const Eigen::Vector3d Xj = Rij * Xi + tij;        // cam-j
       const Eigen::Vector3d Xk = Rjk * Xj + tjk;        // cam-k
@@ -631,7 +624,6 @@ bool GlobalPositioner::EstimateSForTripletRansac(
         continue;
       }
 
-      // project to pixels
       auto proj = [](const Eigen::Vector3d& X,
                      double fx, double fy, double cx, double cy) {
         const double z = std::max(X.z(), 1e-9);
@@ -642,13 +634,11 @@ bool GlobalPositioner::EstimateSForTripletRansac(
       const Eigen::Vector2d pj = proj(Xj, fjx, fjy, cjx, cjy);
       const Eigen::Vector2d pk = proj(Xk, fkx, fky, ckx, cky);
 
-      // build "measured" pixels from unit rays (since we only stored undist rays)
       const Eigen::Vector2d ui = proj(di2, fix, fiy, cix, ciy);
       const Eigen::Vector2d uj = proj(dj2, fjx, fjy, cjx, cjy);
       const Eigen::Vector2d uk = proj(dk2, fkx, fky, ckx, cky);
 
-      const double e =
-          (pi - ui).norm() + (pj - uj).norm() + (pk - uk).norm();
+      const double e = (pi - ui).norm() + (pj - uj).norm() + (pk - uk).norm();
 
       if (e < 3.0 * px_thr) {
         ++inl;
@@ -663,12 +653,11 @@ bool GlobalPositioner::EstimateSForTripletRansac(
     }
   }  // RANSAC loop
 
-  // not enough inliers -> reject triplet
+  // RANSAC gating
   if (best_inl < options_.tri_min_inliers) {
     return false;
   }
 
-  // extra quality gate: median reproj must be small
   double median_err = 0.0;
   if (!best_errs.empty()) {
     std::nth_element(best_errs.begin(),
@@ -676,13 +665,102 @@ bool GlobalPositioner::EstimateSForTripletRansac(
                      best_errs.end());
     median_err = best_errs[best_errs.size() / 2];
   }
-  const double kReprojFactor = 1.2;  // tunable
+  const double kReprojFactor = 1.2;
   if (median_err > kReprojFactor * px_thr) {
-    // bad triplet -> do not emit any edge scale
     return false;
   }
 
-  *s_out = best_s;
+  // Export best_s and stats
+  if (s_out) *s_out = best_s;
+  if (best_inliers_out) *best_inliers_out = best_inl;
+  if (median_err_out) *median_err_out = median_err;
+
+  // ------------------------------------------------------------------
+  // Build A_local list for all inlier tracks under the best hypothesis.
+  // This will be used later in the global LS SVD.
+  // ------------------------------------------------------------------
+  if (!A_list_out) {
+    return true;
+  }
+
+  A_list_out->clear();
+
+  const Eigen::Vector3d tij_best = best_s(0) * t_hat_ij;
+  const Eigen::Vector3d tjk_best = best_s(1) * t_hat_jk;
+  const Eigen::Vector3d tik_best = best_s(2) * t_hat_ik;
+
+  for (const track_t tid : tids) {
+    const auto& tr = tracks.at(tid);
+    const int fi2 = FindObs(tr, i);
+    const int fj2 = FindObs(tr, j);
+    const int fk2 = FindObs(tr, k);
+    if (fi2 < 0 || fj2 < 0 || fk2 < 0) continue;
+
+    const Eigen::Vector3d di2 = NormalizeSafe(images.at(i).features_undist[fi2]);
+    const Eigen::Vector3d dj2 = NormalizeSafe(images.at(j).features_undist[fj2]);
+    const Eigen::Vector3d dk2 = NormalizeSafe(images.at(k).features_undist[fk2]);
+
+    // Depth solve again under best hypothesis to check inlier condition.
+    Eigen::Matrix<double, 9, 3> A9;
+    Eigen::Matrix<double, 9, 1> b9;
+    A9.setZero(); b9.setZero();
+
+    A9.block<3,1>(0,0) = -(Rij * di2);
+    A9.block<3,1>(0,1) =  dj2;
+    b9.segment<3>(0)   =  tij_best;
+
+    A9.block<3,1>(3,1) = -(Rjk * dj2);
+    A9.block<3,1>(3,2) =  dk2;
+    b9.segment<3>(3)   =  tjk_best;
+
+    A9.block<3,1>(6,0) = -(Rik * di2);
+    A9.block<3,1>(6,2) =  dk2;
+    b9.segment<3>(6)   =  tik_best;
+
+    Eigen::Vector3d lambda = A9.colPivHouseholderQr().solve(b9);
+    if (!lambda.allFinite()) continue;
+    if (lambda(0) <= min_depth ||
+        lambda(1) <= min_depth ||
+        lambda(2) <= min_depth) {
+      continue;
+    }
+
+    const Eigen::Vector3d Xi = lambda(0) * di2;
+    const Eigen::Vector3d Xj = Rij * Xi + tij_best;
+    const Eigen::Vector3d Xk = Rjk * Xj + tjk_best;
+    if (Xi.z() <= min_depth || Xj.z() <= min_depth || Xk.z() <= min_depth) {
+      continue;
+    }
+
+    auto proj = [](const Eigen::Vector3d& X,
+                   double fx, double fy, double cx, double cy) {
+      const double z = std::max(X.z(), 1e-9);
+      return Eigen::Vector2d(fx * (X.x() / z) + cx,
+                             fy * (X.y() / z) + cy);
+    };
+    const Eigen::Vector2d pi = proj(Xi, fix, fiy, cix, ciy);
+    const Eigen::Vector2d pj = proj(Xj, fjx, fjy, cjx, cjy);
+    const Eigen::Vector2d pk = proj(Xk, fkx, fky, ckx, cky);
+
+    const Eigen::Vector2d ui = proj(di2, fix, fiy, cix, ciy);
+    const Eigen::Vector2d uj = proj(dj2, fjx, fjy, cjx, cjy);
+    const Eigen::Vector2d uk = proj(dk2, fkx, fky, ckx, cky);
+
+    const double e = (pi - ui).norm() + (pj - uj).norm() + (pk - uk).norm();
+    if (e >= 3.0 * px_thr) {
+      continue;
+    }
+
+    // Build local 3x3 constraint: A_local * [s_ij, s_jk, s_ik]^T ≈ 0
+    const Eigen::Vector3d B = (Rjk * Rij - Rik) * di2;
+    Eigen::Matrix3d A_local;
+    A_local.col(0) = B.cross(Rjk * t_hat_ij);
+    A_local.col(1) = B.cross(t_hat_jk);
+    A_local.col(2) = B.cross(-t_hat_ik);
+
+    A_list_out->push_back(A_local);
+  }
+
   return true;
 }
 
@@ -691,12 +769,10 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     const std::unordered_map<image_t, Image>& images,
     const std::unordered_map<track_t, Track>& tracks,
     const std::unordered_map<camera_t, Camera>& cameras,
-    std::unordered_map<uint64_t, std::vector<double>>& edge_scales) {
-  (void)cameras;
+    std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales) {
   edge_scales.clear();
 
-  // 1) build local triplet -> tids map in O(#tracks * (#obs_in_track)^3)
-  //    (for typical SfM tracks, (#obs_in_track) is small, so this is OK)
+  // 1) Build local triplet -> tids map in O(#tracks * (#obs_in_track)^3)
   using TripletMap =
       std::unordered_map<TripletKey, std::vector<track_t>, TripletKeyHash>;
   TripletMap triplet_map;
@@ -706,7 +782,6 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     const auto& obs = tr.observations;
     if (obs.size() < 3) continue;
 
-    // collect image ids of this track
     std::vector<image_t> img_ids;
     img_ids.reserve(obs.size());
     for (const auto& o : obs) {
@@ -723,7 +798,6 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
           image_t ia = img_ids[a];
           image_t ib = img_ids[b];
           image_t ic = img_ids[c];
-          // canonical order
           if (ib < ia) std::swap(ia, ib);
           if (ic < ib) std::swap(ib, ic);
           if (ib < ia) std::swap(ia, ib);
@@ -736,68 +810,54 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     }
   }
 
-  // 2) run triplet RANSAC only on those triplets we actually saw
+  // Container for all local constraints: each corresponds to one inlier track of a valid triplet.
+  struct TripletConstraint {
+    image_t i, j, k;
+    Eigen::Matrix3d A_local;
+  };
+  std::vector<TripletConstraint> constraints;
+  constraints.reserve(triplet_map.size() * 4);  // rough guess
+
   int num_triplets_total   = 0;
   int num_triplets_success = 0;
-  int num_edges_touched    = 0;
-  const double kMinEdgeScale = 1e-4;
 
   for (const auto& kv : triplet_map) {
     const TripletKey& key = kv.first;
     const std::vector<track_t>& tids3 = kv.second;
     ++num_triplets_total;
 
-    // very small support -> skip entirely (treat as outlier triplet)
+    // Require a minimum number of supporting 3-view tracks.
     if (static_cast<int>(tids3.size()) < options_.tri_min_inliers) {
       continue;
     }
 
     Eigen::Vector3d s_ijk;
+    int best_inl = 0;
+    double median_err = 0.0;
+    std::vector<Eigen::Matrix3d> A_list;
+
     if (EstimateSForTripletRansac(key.i, key.j, key.k,
                                   tids3,
                                   view_graph, images, tracks, cameras,
-                                  &s_ijk)) {
-      ++num_triplets_success;
-
-      // keep only positive-ish scales
-      const double s_ij = std::abs(s_ijk.x());
-      const double s_jk = std::abs(s_ijk.y());
-      const double s_ik = std::abs(s_ijk.z());
-
-      if (s_ij > kMinEdgeScale) {
-        edge_scales[EdgeKey(key.i, key.j)].push_back(s_ij);
-        ++num_edges_touched;
-      }
-      if (s_jk > kMinEdgeScale) {
-        edge_scales[EdgeKey(key.j, key.k)].push_back(s_jk);
-        ++num_edges_touched;
-      }
-      if (s_ik > kMinEdgeScale) {
-        edge_scales[EdgeKey(key.i, key.k)].push_back(s_ik);
-        ++num_edges_touched;
+                                  &s_ijk,
+                                  &best_inl,
+                                  &median_err,
+                                  &A_list)) {
+      if (!A_list.empty()) {
+        ++num_triplets_success;
+        for (const auto& A_local : A_list) {
+          TripletConstraint tc;
+          tc.i = key.i;
+          tc.j = key.j;
+          tc.k = key.k;
+          tc.A_local = A_local;
+          constraints.push_back(std::move(tc));
+        }
       }
     }
   }
 
-  // 3) post-filter edges with too-small scales inside each edge
-  int num_edges_before = static_cast<int>(edge_scales.size());
-  int num_edges_removed_by_scale = 0;
-
-  for (auto it = edge_scales.begin(); it != edge_scales.end(); ) {
-    auto& vec = it->second;
-    vec.erase(
-        std::remove_if(vec.begin(), vec.end(),
-                       [kMinEdgeScale](double s) {
-                         return s < kMinEdgeScale;
-                       }),
-        vec.end());
-    if (vec.empty()) {
-      it = edge_scales.erase(it);
-      ++num_edges_removed_by_scale;
-    } else {
-      ++it;
-    }
-  }
+  const double kMinEdgeScale = 1e-4;
 
   LOG(INFO) << "[TRI_RANSAC] triplets (unique) = " << num_triplets_total
             << ", success = " << num_triplets_success
@@ -805,26 +865,157 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
             << (num_triplets_total > 0
                     ? static_cast<double>(num_triplets_success)
                           / static_cast<double>(num_triplets_total)
-                    : 0.0);
+                    : 0.0)
+            << ", local constraints (3x3 blocks) = " << constraints.size();
 
-  LOG(INFO) << "[TRI_RANSAC] edges proposed = " << num_edges_touched
-            << ", unique edges before = " << num_edges_before
-            << ", unique edges after = " << edge_scales.size()
+  // If no constraints survived, nothing to do.
+  if (constraints.empty()) {
+    LOG(WARNING) << "[GLOBAL_LS] No valid triplet constraints; edge scales remain empty.";
+    return;
+  }
+
+  // 2) Build global linear system: Aglob * s ≈ 0
+  //    - each (i,j,k, A_local) adds 3 rows and touches 3 edge variables.
+  struct GlobalConstraint {
+    int e_ij;
+    int e_jk;
+    int e_ik;
+    Eigen::Matrix3d A_local;
+  };
+
+  std::unordered_map<uint64_t, int> edge_to_id;
+  edge_to_id.reserve(constraints.size() * 2);
+
+  auto get_edge_id = [&edge_to_id](uint64_t key) -> int {
+    auto it = edge_to_id.find(key);
+    if (it != edge_to_id.end()) {
+      return it->second;
+    }
+    const int new_id = static_cast<int>(edge_to_id.size());
+    edge_to_id.emplace(key, new_id);
+    return new_id;
+  };
+
+  std::vector<GlobalConstraint> gconstraints;
+  gconstraints.reserve(constraints.size());
+
+  for (const auto& tc : constraints) {
+    const uint64_t key_ij = EdgeKey(tc.i, tc.j);
+    const uint64_t key_jk = EdgeKey(tc.j, tc.k);
+    const uint64_t key_ik = EdgeKey(tc.i, tc.k);
+
+    GlobalConstraint gc;
+    gc.e_ij = get_edge_id(key_ij);
+    gc.e_jk = get_edge_id(key_jk);
+    gc.e_ik = get_edge_id(key_ik);
+    gc.A_local = tc.A_local;
+    gconstraints.push_back(std::move(gc));
+  }
+
+  const int num_edges = static_cast<int>(edge_to_id.size());
+  const int num_rows  = 3 * static_cast<int>(gconstraints.size());
+
+  LOG(INFO) << "[GLOBAL_LS] A size: " << num_rows << " x " << num_edges
+            << " (rows = 3 * #constraints, cols = #edges)";
+
+  if (num_edges == 0) {
+    LOG(WARNING) << "[GLOBAL_LS] No edges created from triplets.";
+    return;
+  }
+
+  Eigen::MatrixXd Aglob(num_rows, num_edges);
+  Aglob.setZero();
+
+  for (int idx = 0; idx < static_cast<int>(gconstraints.size()); ++idx) {
+    const int r = 3 * idx;
+    const auto& gc = gconstraints[idx];
+    // Note: A_local is 3x3; each column corresponds to one of (s_ij, s_jk, s_ik).
+    Aglob.block<3,1>(r, gc.e_ij) = gc.A_local.col(0);
+    Aglob.block<3,1>(r, gc.e_jk) = gc.A_local.col(1);
+    Aglob.block<3,1>(r, gc.e_ik) = gc.A_local.col(2);
+  }
+
+  // 3) Solve Aglob * s ≈ 0 using SVD: smallest singular value gives the nullspace.
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(
+      Aglob, Eigen::ComputeThinV);
+  const Eigen::VectorXd singular_values = svd.singularValues();
+  Eigen::VectorXd s_global = svd.matrixV().col(num_edges - 1);
+
+  const int topk = std::min(10, static_cast<int>(singular_values.size()));
+  LOG(INFO) << "[GLOBAL_LS] singular values (top " << topk << "):";
+  for (int i = 0; i < topk; ++i) {
+    LOG(INFO) << "  S[" << i << "] = " << singular_values(i);
+  }
+
+  // 4) Normalize s_global by the median of |s|
+  // Eigen::VectorXd s_abs = s_global.cwiseAbs();
+  // std::vector<double> nonzero;
+  // nonzero.reserve(num_edges);
+  // for (int e = 0; e < num_edges; ++e) {
+  //   if (s_abs(e) > 1e-9) {
+  //     nonzero.push_back(s_abs(e));
+  //   }
+  // }
+
+  // double scale_norm = 1.0;
+  // if (!nonzero.empty()) {
+  //   std::nth_element(nonzero.begin(),
+  //                    nonzero.begin() + nonzero.size() / 2,
+  //                    nonzero.end());
+  //   scale_norm = nonzero[nonzero.size() / 2];
+  // }
+
+  // if (scale_norm <= 0.0) {
+  //   scale_norm = 1.0;
+  // }
+  // s_global /= scale_norm;
+
+  // 5) Build edge scales and simple support counts.
+  std::vector<int> edge_support(num_edges, 0);
+  for (const auto& gc : gconstraints) {
+    edge_support[gc.e_ij]++;
+    edge_support[gc.e_jk]++;
+    edge_support[gc.e_ik]++;
+  }
+
+  int num_edges_before = num_edges;
+  int num_edges_after  = 0;
+  int num_edges_removed_by_scale = 0;
+
+  for (const auto& kv : edge_to_id) {
+    const uint64_t ekey = kv.first;
+    const int eid = kv.second;
+    const double s_val = std::abs(s_global(eid));
+
+    if (s_val < kMinEdgeScale) {
+      ++num_edges_removed_by_scale;
+      continue;
+    }
+
+    EdgeScaleSample sample;
+    sample.s          = s_val;
+    sample.inliers    = edge_support[eid];  // number of local constraints touching this edge
+    sample.median_err = 0.0;               // unknown here; we leave it as 0
+
+    edge_scales[ekey].push_back(sample);
+    ++num_edges_after;
+  }
+
+  LOG(INFO) << "[GLOBAL_LS] edges (unique) before = " << num_edges_before
+            << ", after scale-threshold = " << num_edges_after
             << ", removed_by_scale = " << num_edges_removed_by_scale
             << " (thres=" << kMinEdgeScale << ")";
 
   if (VLOG_IS_ON(2)) {
-    for (const auto& e : edge_scales) {
-      const uint64_t key = e.first;
+    for (const auto& kv : edge_scales) {
+      const uint64_t key = kv.first;
       const image_t u = static_cast<image_t>(key >> 32);
       const image_t v = static_cast<image_t>(key & 0xffffffff);
-      const auto& vs = e.second;
-      std::vector<double> tmp = vs;
-      std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
-      const double med = tmp[tmp.size() / 2];
-      LOG(INFO) << "[TRI_RANSAC] edge (" << u << "," << v
-                << ") count=" << vs.size()
-                << " median=" << med;
+      const auto& vec = kv.second;
+      double s_val = vec.front().s;
+      LOG(INFO) << "[GLOBAL_LS] edge (" << u << "," << v
+                << ") s = " << s_val
+                << ", support = " << vec.front().inliers;
     }
   }
 }
@@ -850,87 +1041,187 @@ bool GlobalPositioner::GetWorldDirection(
 void GlobalPositioner::InitializeCamerasFromTriScales(
       const ViewGraph& view_graph,
       std::unordered_map<image_t, Image>& images,
-      const std::unordered_map<uint64_t, std::vector<double>>& edge_scales) {
+      const std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales) {
   if (images.empty()) return;
 
-  // pick a root
-  const image_t root = images.begin()->first;
-  images[root].cam_from_world.translation.setZero();
+  // ------------------------------------------------------------------
+  // 1) Build adjacency using only edges that have triplet-based scales.
+  //    This defines the "good" graph on which we build a backbone.
+  // ------------------------------------------------------------------
+  using Neighbor = std::pair<image_t, double>;  // (neighbor id, best scale)
+  std::unordered_map<image_t, std::vector<Neighbor>> good_adj;
+  good_adj.reserve(images.size());
 
+  for (const auto& [pair_id, ipair] : view_graph.image_pairs) {
+    if (!ipair.is_valid) continue;
+
+    const image_t u = ipair.image_id1;
+    const image_t v = ipair.image_id2;
+    const uint64_t key = EdgeKey(u, v);
+
+    auto it_s = edge_scales.find(key);
+    if (it_s == edge_scales.end() || it_s->second.empty()) {
+      // No triplet-based scale for this edge -> do not use it in the backbone.
+      continue;
+    }
+
+    const auto& samples = it_s->second;
+
+    // Select the best sample based on (inliers, -median_err).
+    const EdgeScaleSample* best = &samples[0];
+    for (const auto& es : samples) {
+      if (es.inliers > best->inliers) {
+        best = &es;
+      } else if (es.inliers == best->inliers &&
+                 es.median_err < best->median_err) {
+        best = &es;
+      }
+    }
+
+    const double s_uv = best->s;
+    if (s_uv <= 0.0) {
+      continue;  // Just in case, ignore non-positive scales.
+    }
+
+    good_adj[u].emplace_back(v, s_uv);
+    good_adj[v].emplace_back(u, s_uv);
+  }
+
+  // ------------------------------------------------------------------
+  // 2) BFS over the "good" graph to initialize a backbone of cameras.
+  //    Only edges with triplet scales contribute here (no 1.0 fallback).
+  // ------------------------------------------------------------------
   std::unordered_set<image_t> visited;
-  visited.insert(root);
+  visited.reserve(images.size());
 
   std::queue<image_t> q;
-  q.push(root);
 
-  struct GoodEdge {
-    image_t v;
-    double s_uv;
-  };
+  int num_backbone_components = 0;
+  int num_backbone_nodes = 0;
 
-  std::unordered_map<image_t, std::vector<GoodEdge>> good_adj;
+  // We may have multiple connected components in the good graph.
+  for (auto& [image_id, image] : images) {
+    if (visited.count(image_id)) continue;
+    if (good_adj.find(image_id) == good_adj.end()) {
+      // This image has no incident good edges; we'll handle it later.
+      continue;
+    }
 
-  int num_edges_bfs       = 0;
-  int num_edges_with_scale = 0;
-  int num_edges_fallback   = 0;
+    // Start a new backbone component from this image.
+    ++num_backbone_components;
 
-  while (!q.empty()) {
-    const image_t u = q.front();
-    q.pop();
+    // For each component, we set its root translation to zero.
+    // Different components are not aligned to each other yet; BA will
+    // handle the global gauge freedoms later.
+    image.cam_from_world.translation.setZero();
+    visited.insert(image_id);
+    q.push(image_id);
+    ++num_backbone_nodes;
 
-    // traverse neighbors from view-graph
-    for (const auto& [pair_id, ipair] : view_graph.image_pairs) {
-      if (!ipair.is_valid) continue;
-      image_t v = static_cast<image_t>(-1);
-      if (ipair.image_id1 == u) v = ipair.image_id2;
-      else if (ipair.image_id2 == u) v = ipair.image_id1;
-      else continue;
+    while (!q.empty()) {
+      const image_t u = q.front();
+      q.pop();
 
-      if (visited.count(v)) continue;
-
-      ++num_edges_bfs;
-
-      // get scale
-      const uint64_t key = EdgeKey(u, v);
-      double s_uv = 1.0;
-      auto it_s = edge_scales.find(key);
-      if (it_s != edge_scales.end() && !it_s->second.empty()) {
-        // median
-        std::vector<double> buf = it_s->second;
-        std::nth_element(buf.begin(),
-                         buf.begin() + buf.size() / 2,
-                         buf.end());
-        s_uv = buf[buf.size() / 2];
-        ++num_edges_with_scale;
-      } else {
-        ++num_edges_fallback;   // s_uv = 1.0 fallback
+      const auto it_adj = good_adj.find(u);
+      if (it_adj == good_adj.end()) {
+        continue;
       }
 
-      // get direction in world
-      Eigen::Vector3d dir_w;
-      if (!GetWorldDirection(view_graph, images, u, v, &dir_w)) {
-        dir_w = Eigen::Vector3d(1, 0, 0);
+      for (const Neighbor& nb : it_adj->second) {
+        const image_t v = nb.first;
+        const double s_uv = nb.second;
+        if (visited.count(v)) continue;
+
+        Eigen::Vector3d dir_w;
+        if (!GetWorldDirection(view_graph, images, u, v, &dir_w)) {
+          // Fallback direction if the relative pose is missing or invalid.
+          dir_w = Eigen::Vector3d(1, 0, 0);
+        }
+
+        images[v].cam_from_world.translation =
+            images[u].cam_from_world.translation + s_uv * dir_w;
+
+        visited.insert(v);
+        q.push(v);
+        ++num_backbone_nodes;
       }
-
-      images[v].cam_from_world.translation =
-          images[u].cam_from_world.translation + s_uv * dir_w;
-
-      visited.insert(v);
-      q.push(v);
     }
   }
 
-  LOG(INFO) << "[TRI_RANSAC] BFS edges used = " << num_edges_bfs
-          << ", with_scale = " << num_edges_with_scale
-          << ", fallback_1.0 = " << num_edges_fallback
-          << ", ratio_with_scale = "
-          << (num_edges_bfs > 0
-                ? static_cast<double>(num_edges_with_scale) /
-                      static_cast<double>(num_edges_bfs)
-                : 0.0);
+  LOG(INFO) << "[TRI_RANSAC] backbone components (good edges only) = "
+            << num_backbone_components
+            << ", backbone cameras = " << num_backbone_nodes;
 
-  LOG(INFO) << "[TRI_RANSAC] initialized " << visited.size()
-            << " camera centers from triplet edge scales.";
+  // ------------------------------------------------------------------
+  // 3) Attach remaining images (not in 'visited') to the backbone using
+  //    the full view-graph. Here we allow 1.0-scale fallback, but only
+  //    for nodes that could not be initialized from triplet-based edges.
+  //
+  //    We iteratively grow a tree from the set of 'visited' cameras:
+  //    in each iteration, we try to connect any unvisited node that has
+  //    at least one neighbor already in 'visited'.
+  // ------------------------------------------------------------------
+  const double kFallbackScale = 1.0;
+
+  bool progress = true;
+  int num_attached = 0;
+
+  while (progress) {
+    progress = false;
+
+    for (auto& [image_id, image] : images) {
+      if (visited.count(image_id)) {
+        continue;  // Already initialized in backbone or attached.
+      }
+
+      // Find a neighbor in the view graph that is already visited.
+      image_t best_neighbor = static_cast<image_t>(-1);
+
+      // NOTE: This is O(#image_pairs * #images) in the worst case.
+      //       For large problems, consider pre-building a full adjacency
+      //       list for the view-graph to make this faster.
+      for (const auto& [pair_id, ipair] : view_graph.image_pairs) {
+        if (!ipair.is_valid) continue;
+        const image_t u = ipair.image_id1;
+        const image_t v = ipair.image_id2;
+
+        if (u == image_id && visited.count(v)) {
+          best_neighbor = v;
+          break;
+        } else if (v == image_id && visited.count(u)) {
+          best_neighbor = u;
+          break;
+        }
+      }
+
+      if (best_neighbor == static_cast<image_t>(-1)) {
+        // No connection to the current visited set in this iteration.
+        continue;
+      }
+
+      Eigen::Vector3d dir_w;
+      if (!GetWorldDirection(view_graph, images, best_neighbor, image_id, &dir_w)) {
+        dir_w = Eigen::Vector3d(1, 0, 0);
+      }
+
+      images[image_id].cam_from_world.translation =
+          images[best_neighbor].cam_from_world.translation +
+          kFallbackScale * dir_w;
+
+      visited.insert(image_id);
+      ++num_attached;
+      progress = true;
+    }
+  }
+
+  const size_t num_total = images.size();
+  const size_t num_uninitialized = num_total - visited.size();
+
+  LOG(INFO) << "[TRI_RANSAC] attached cameras (fallback tree) = "
+            << num_attached
+            << ", total initialized = " << visited.size()
+            << " / " << num_total
+            << ", still uninitialized = " << num_uninitialized;
 }
 
 void GlobalPositioner::InitializePointsFromCameras(

@@ -12,6 +12,12 @@
 
 namespace glomap {
 
+struct EdgeScaleSample {
+  double s;          // scale for the edge
+  int inliers;       // number of inliers supporting this triplet hypothesis
+  double median_err; // median reprojection error for this hypothesis
+};
+
 struct GlobalPositionerOptions : public OptimizationBaseOptions {
   // Which constraints to use in global positioning.
   enum ConstraintType {
@@ -172,7 +178,10 @@ class GlobalPositioner {
       const std::unordered_map<image_t, Image>& images,
       const std::unordered_map<track_t, Track>& tracks,
       const std::unordered_map<camera_t, Camera>& cameras,
-      Eigen::Vector3d* s_out);
+      Eigen::Vector3d* s_out,
+      int* best_inliers_out,
+      double* median_err_out,
+      std::vector<Eigen::Matrix3d>* A_list_out);
 
   // Collect per-edge scale hypotheses from all triplets (i,j,k).
   void EstimateEdgeScalesByTriRansac(
@@ -180,13 +189,13 @@ class GlobalPositioner {
       const std::unordered_map<image_t, Image>& images,
       const std::unordered_map<track_t, Track>& tracks,
       const std::unordered_map<camera_t, Camera>& cameras,
-      std::unordered_map<uint64_t, std::vector<double>>& edge_scales);
+      std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales);
 
   // Place cameras in world using view-graph directions + per-edge scales.
   void InitializeCamerasFromTriScales(
       const ViewGraph& view_graph,
       std::unordered_map<image_t, Image>& images,
-      const std::unordered_map<uint64_t, std::vector<double>>& edge_scales);
+      const std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales);
 
   // Get world-space direction from src -> dst using the relative translation
   // stored in the view graph (converted from dst camera frame to world frame).
