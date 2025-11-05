@@ -41,6 +41,43 @@ struct BATAPairwiseDirectionError {
 };
 
 // ----------------------------------------
+// EdgeScaleLogRegularization
+// ----------------------------------------
+// residual = sqrt(weight) * (log ||c_j - c_i|| - log s_ij)
+struct EdgeScaleLogRegularization {
+  explicit EdgeScaleLogRegularization(double weight)
+      : sqrt_weight_(std::sqrt(weight)) {}
+
+  template <typename T>
+  bool operator()(const T* ci,
+                  const T* cj,
+                  const T* s_ij,
+                  T* residuals) const {
+    Eigen::Map<const Eigen::Matrix<T,3,1>> Ci(ci);
+    Eigen::Map<const Eigen::Matrix<T,3,1>> Cj(cj);
+
+    Eigen::Matrix<T,3,1> d = Cj - Ci;
+    const T eps = T(1e-8);
+    T len = ceres::sqrt(d.squaredNorm() + eps * eps);
+
+    residuals[0] =
+        T(sqrt_weight_) * (ceres::log(len) - ceres::log(s_ij[0]));
+    return true;
+  }
+
+  static ceres::CostFunction* Create(double weight) {
+    return new ceres::AutoDiffCostFunction<EdgeScaleLogRegularization,
+                                           1,  // residual dimension
+                                           3,  // c_i
+                                           3,  // c_j
+                                           1   // s_ij
+                                           >(new EdgeScaleLogRegularization(weight));
+  }
+
+  double sqrt_weight_;
+};
+
+// ----------------------------------------
 // FetzerFocalLengthCost
 // ----------------------------------------
 // Below are assets for DMAP by Philipp Lindenberger

@@ -188,14 +188,13 @@ void OptionManager::AddGlobalPositionerOptions() {
                               &mapper->opt_gp.optimize_scales);
   AddAndRegisterDefaultOption("GlobalPositioning.thres_loss_function",
                               &mapper->opt_gp.thres_loss_function);
-  AddAndRegisterDefaultOption(
-      "GlobalPositioning.max_num_iterations",
-      &mapper->opt_gp.solver_options.max_num_iterations);
+  AddAndRegisterDefaultOption("GlobalPositioning.max_num_iterations",
+                              &mapper->opt_gp.solver_options.max_num_iterations);
 
   // DO NOT expose enum directly to Boost CLI (it cannot parse enum by default).
   // Keep it code-only. If you need CLI, add a string option and map it manually.
   AddAndRegisterDefaultOption("GlobalPositioning.constraint_type",
-                            &mapper->opt_gp.constraint_type_cli);
+                              &mapper->opt_gp.constraint_type_cli);
 
   // === New: initialization strategy & CSV dump ===
   // 0: RANDOM, 1: SCALED_TRIPLET
@@ -205,13 +204,21 @@ void OptionManager::AddGlobalPositionerOptions() {
                               &mapper->opt_gp.dump_init_centers_csv);
   AddAndRegisterDefaultOption("GlobalPositioning.init_centers_csv_path",
                               &mapper->opt_gp.init_centers_csv_path);
+  AddAndRegisterDefaultOption("GlobalPositioning.dump_edge_graphs_csv",
+                              &mapper->opt_gp.dump_edge_graphs_csv);
+  AddAndRegisterDefaultOption("GlobalPositioning.edge_graphs_csv_path",
+                              &mapper->opt_gp.edge_graphs_csv_path);
+  AddAndRegisterDefaultOption("GlobalPositioning.use_gt_edge_scales",
+                              &mapper->opt_gp.use_gt_edge_scales);
+  AddAndRegisterDefaultOption("GlobalPositioning.gt_edge_scales_csv_path",
+                              &mapper->opt_gp.gt_edge_scales_csv_path);
 
   // Triplet-RANSAC specific options
 
   AddAndRegisterDefaultOption("GlobalPositioning.tri_ransac_max_iters",
                               &mapper->opt_gp.tri_ransac_max_iters);
   AddAndRegisterDefaultOption("GlobalPositioning.tri_min_inliers",
-                              &mapper->opt_gp.tri_min_inliers);
+                              &mapper->opt_gp.tri_min_inliers_global);
   AddAndRegisterDefaultOption("GlobalPositioning.tri_max_triplets_per_track",
                               &mapper->opt_gp.tri_max_triplets_per_track);
   AddAndRegisterDefaultOption("GlobalPositioning.tri_min_depth",
@@ -219,7 +226,12 @@ void OptionManager::AddGlobalPositionerOptions() {
   AddAndRegisterDefaultOption("GlobalPositioning.tri_inlier_ang_thresh_deg",
                               &mapper->opt_gp.tri_inlier_ang_thresh_deg);
   AddAndRegisterDefaultOption("GlobalPositioning.tri_inlier_px_thresh",
-                              &mapper->opt_gp.tri_inlier_px_thresh);
+                              &mapper->opt_gp.tri_inlier_px_thresh_global);
+
+  // New: edge scale prior weight
+  AddAndRegisterDefaultOption("GlobalPositioning.edge_scale_prior_weight",
+                              &mapper->opt_gp.edge_scale_prior_weight);
+
 }
 
   // // === New: initialization strategy & CSV dump ===
