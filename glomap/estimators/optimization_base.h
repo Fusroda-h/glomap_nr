@@ -20,7 +20,7 @@ struct OptimizationBaseOptions {
 
   OptimizationBaseOptions() {
     solver_options.num_threads = std::thread::hardware_concurrency();
-    solver_options.max_num_iterations = 100;
+    solver_options.max_num_iterations = 1000;
     solver_options.minimizer_progress_to_stdout = false;
     solver_options.function_tolerance = 1e-5;
   }

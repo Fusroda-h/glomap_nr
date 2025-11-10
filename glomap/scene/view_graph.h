@@ -5,6 +5,7 @@
 #include "glomap/scene/image_pair.h"
 #include "glomap/scene/types.h"
 #include "glomap/types.h"
+#include <string>
 
 namespace glomap {
 
@@ -12,6 +13,8 @@ class ViewGraph {
  public:
   // Methods
   inline void RemoveInvalidPair(image_pair_t pair_id);
+
+  void DumpCsv(const std::string& path) const;
 
   // Mark the image which is not connected to any other images as not registered
   // Return: the number of images in the largest connected component

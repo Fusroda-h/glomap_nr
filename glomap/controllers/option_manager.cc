@@ -79,6 +79,8 @@ void OptionManager::AddGlobalMapperOptions() {
   AddAndRegisterDefaultOption("skip_retriangulation",
                               &mapper->skip_retriangulation);
   AddAndRegisterDefaultOption("skip_pruning", &mapper->skip_pruning);
+  AddAndRegisterDefaultOption("skip_pnp", &mapper->skip_global_pnp);
+  AddAndRegisterDefaultOption("debug_output_dir", &mapper->debug_output_dir);
 }
 
 void OptionManager::AddGlobalMapperFullOptions() {
@@ -217,14 +219,8 @@ void OptionManager::AddGlobalPositionerOptions() {
 
   AddAndRegisterDefaultOption("GlobalPositioning.tri_ransac_max_iters",
                               &mapper->opt_gp.tri_ransac_max_iters);
-  AddAndRegisterDefaultOption("GlobalPositioning.tri_min_inliers",
-                              &mapper->opt_gp.tri_min_inliers_global);
-  AddAndRegisterDefaultOption("GlobalPositioning.tri_max_triplets_per_track",
-                              &mapper->opt_gp.tri_max_triplets_per_track);
-  AddAndRegisterDefaultOption("GlobalPositioning.tri_min_depth",
-                              &mapper->opt_gp.tri_min_depth);
-  AddAndRegisterDefaultOption("GlobalPositioning.tri_inlier_ang_thresh_deg",
-                              &mapper->opt_gp.tri_inlier_ang_thresh_deg);
+  AddAndRegisterDefaultOption("GlobalPositioning.tri_min_inlier_ratio",
+                              &mapper->opt_gp.tri_min_inlier_ratio_global);
   AddAndRegisterDefaultOption("GlobalPositioning.tri_inlier_px_thresh",
                               &mapper->opt_gp.tri_inlier_px_thresh_global);
 

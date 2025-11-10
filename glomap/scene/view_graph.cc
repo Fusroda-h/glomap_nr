@@ -3,6 +3,8 @@
 #include "glomap/math/union_find.h"
 
 #include <queue>
+#include <glog/logging.h>
+#include <fstream>
 
 namespace glomap {
 
@@ -120,4 +122,34 @@ void ViewGraph::EstablishAdjacencyList() {
     }
   }
 }
+
+
+void ViewGraph::DumpCsv(const std::string& path) const {
+  std::ofstream ofs(path);
+  if (!ofs.is_open()) {
+    LOG(ERROR) << "[ViewGraph::DumpCsv] Cannot open file: " << path;
+    return;
+  }
+
+  // 파이썬 스크립트가 최소한 "i","j","inliers" 만 있으면 읽을 수 있음.
+  ofs << "i,j,inliers\n";
+
+  for (const auto& kv : image_pairs) {
+    const auto& image_pair = kv.second;
+    if (!image_pair.is_valid) continue;
+
+    const image_t i = image_pair.image_id1;
+    const image_t j = image_pair.image_id2;
+
+    // inlier 개수
+    const int num_inliers =
+        static_cast<int>(image_pair.inliers.size());
+
+    ofs << i << "," << j << "," << num_inliers << "\n";
+  }
+
+  LOG(INFO) << "[ViewGraph::DumpCsv] Wrote view graph CSV to: " << path;
+}
+
+
 }  // namespace glomap

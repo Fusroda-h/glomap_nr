@@ -6,6 +6,11 @@
 #include <unordered_set>
 #include <fstream>
 #include <algorithm>  
+#include <Eigen/Eigenvalues>
+#include <Eigen/Sparse>
+#include <sstream>
+#include <limits>
+
 
 namespace glomap {
 namespace {
@@ -97,6 +102,26 @@ struct TripletKeyHash {
   }
 };
 
+struct DSU {
+  std::unordered_map<image_t, image_t> parent;
+
+  image_t Find(image_t x) {
+    auto it = parent.find(x);
+    if (it == parent.end()) return parent[x] = x;
+    if (it->second == x) return x;
+    return it->second = Find(it->second);
+  }
+
+  bool Union(image_t a, image_t b) {
+    a = Find(a);
+    b = Find(b);
+    if (a == b) return false;
+    parent[b] = a;
+    return true;
+  }
+};
+
+
 }  // namespace
 
 // ------------------------------------------------------------------
@@ -130,7 +155,10 @@ bool GlobalPositioner::Solve(const ViewGraph& view_graph,
   LOG(INFO) << "[GlobalPositioner] center_init_mode enum = "
           << static_cast<int>(options_.center_init_mode);
 
-  track_ransac_stats_.clear();  
+  track_ransac_stats_.clear();
+
+  const ViewGraph* graph_for_ba = &view_graph;
+  ViewGraph filtered_vg_local;
 
   // If ONLY_POINTS: initialize cameras using triplet RANSAC from directions.
   switch (options_.center_init_mode) {
@@ -138,18 +166,23 @@ bool GlobalPositioner::Solve(const ViewGraph& view_graph,
       // fallback to the original random initialization
       LOG(INFO) << "[GlobalPositioner] CenterInitMode = RANDOM (0)";
       InitializeRandomPositions(view_graph, images, tracks);
+      graph_for_ba = &view_graph;
       break;
       }
     case GlobalPositionerOptions::CenterInitMode::SCALED_TRIPLET: {
       LOG(INFO) << "[GlobalPositioner] CenterInitMode = SCALED_TRIPLET (1)";
       std::unordered_map<uint64_t, std::vector<EdgeScaleSample>> edge_scales;
+      std::unordered_map<uint64_t, int> edge_votes;
       EstimateEdgeScalesByTriRansac(view_graph,images,tracks,
-                                    cameras, edge_scales);
+                                    cameras, edge_scales, &edge_votes);
       FilterEdgeScalesWithTriplet(view_graph, images, tracks, 
                                     cameras, edge_scales);
+      // edge_votes + edge_scales => MST / filtered view_graph
+      BuildFilteredViewGraphWithMST(view_graph, edge_scales, edge_votes, 
+                                    &filtered_vg_local);
+
       // Initialize BA edge scales from refined edge_scales.
       edge_scales_ba_.clear();
-
       for (const auto& kv : edge_scales) {
         const uint64_t key = kv.first;
         const auto& samples = kv.second;
@@ -168,7 +201,7 @@ bool GlobalPositioner::Solve(const ViewGraph& view_graph,
       }
 
       PruneTracksWithRansacStats(tracks);
-      InitializeCamerasFromTriScales(view_graph, images, edge_scales);
+      InitializeCamerasFromTriScales(*graph_for_ba, images, edge_scales);
       PruneOrphanImagesAndTracks(edge_scales, images, tracks);
       InitializePointsFromCameras(cameras, images, tracks);
       LogCameraTrackSupport(images, tracks);
@@ -176,6 +209,8 @@ bool GlobalPositioner::Solve(const ViewGraph& view_graph,
       if (options_.dump_edge_graphs_csv) {
         DumpEdgeGraphCsv(images, edge_scales, options_.edge_graphs_csv_path);
         }
+
+      graph_for_ba = &filtered_vg_local;
       break;
       }
   }
@@ -192,11 +227,11 @@ bool GlobalPositioner::Solve(const ViewGraph& view_graph,
 
   // Setup ceres problem
   LOG(INFO) << "Setting up the global positioner problem";
-  SetupProblem(view_graph, tracks);
+  SetupProblem(*graph_for_ba, tracks);
 
   // Add camera-to-camera constraints unless ONLY_POINTS.
   if (options_.constraint_type != GlobalPositionerOptions::ONLY_POINTS) {
-    AddCameraToCameraConstraints(view_graph, images);
+    AddCameraToCameraConstraints(*graph_for_ba, images);
   }
 
   // Add point-to-camera constraints unless ONLY_CAMERAS.
@@ -328,8 +363,11 @@ void GlobalPositioner::AddCameraToCameraConstraints(
 
     const image_t image_id1 = image_pair.image_id1;
     const image_t image_id2 = image_pair.image_id2;
-    if (images.find(image_id1) == images.end() ||
-        images.find(image_id2) == images.end()) {
+    auto it1 = images.find(image_id1);
+    auto it2 = images.find(image_id2);
+    if (it1 == images.end() || it2 == images.end()) continue;
+
+    if (!it1->second.is_registered || !it2->second.is_registered) {
       continue;
     }
 
@@ -580,6 +618,94 @@ void GlobalPositioner::ParameterizeVariables(
   }
 }
 
+
+std::unordered_set<uint64_t> GlobalPositioner::BuildMSTEdges(
+    const ViewGraph& view_graph,
+    const std::unordered_map<uint64_t, int>& edge_votes) const {
+
+  struct Edge {
+    image_t u, v;
+    uint64_t key;
+    double weight;
+  };
+
+  std::vector<Edge> edges;
+  edges.reserve(view_graph.image_pairs.size());
+
+  for (const auto& kv : view_graph.image_pairs) {
+    const auto& ip = kv.second;
+    if (!ip.is_valid) continue;
+
+    image_t u = ip.image_id1;
+    image_t v = ip.image_id2;
+    uint64_t key = EdgeKey(u, v);
+
+    auto it_vote = edge_votes.find(key);
+    if (it_vote == edge_votes.end()) continue;
+    int vote = it_vote->second;
+
+    if (vote <= 0) continue;  // 아예 outlier 성향 edge는 후보에서 제외
+
+    // vote가 클수록 weight 작게
+    double w = 1.0 / (static_cast<double>(vote) + 1e-6);
+    edges.push_back({u, v, key, w});
+  }
+
+  std::sort(edges.begin(), edges.end(),
+            [](const Edge& a, const Edge& b) {
+              return a.weight < b.weight;
+            });
+
+  DSU dsu;
+  std::unordered_set<uint64_t> mst_edges;
+  mst_edges.reserve(edges.size());
+
+  for (const auto& e : edges) {
+    if (dsu.Union(e.u, e.v)) {
+      mst_edges.insert(e.key);
+    }
+  }
+  return mst_edges;
+}
+
+void GlobalPositioner::BuildFilteredViewGraphWithMST(
+    const ViewGraph& orig,
+    const std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales,
+    const std::unordered_map<uint64_t, int>& edge_votes,
+    ViewGraph* out) const {
+
+  out->image_pairs.clear();
+
+  // 1) MST edge 집합
+  const std::unordered_set<uint64_t> mst_edges = BuildMSTEdges(orig, edge_votes);
+
+  size_t cnt_triplet_edges = 0;
+
+  for (const auto& kv : orig.image_pairs) {
+    const auto& ip = kv.second;
+    if (!ip.is_valid) continue;
+
+    image_t u = ip.image_id1;
+    image_t v = ip.image_id2;
+    uint64_t key = EdgeKey(u, v);
+
+    // MST 에 포함되어 있어야 하고
+    // if (mst_edges.find(key) == mst_edges.end()) continue;
+
+    // triplet 기반 scale 도 있어야 함
+    auto it_s = edge_scales.find(key);
+    if (it_s == edge_scales.end() || it_s->second.empty()) continue;
+    ++cnt_triplet_edges;
+
+    // 통과된 edge만 새 view_graph에 복사
+    out->image_pairs.emplace(kv.first, ip);
+  }
+
+  LOG(INFO) << "[VIEW_GRAPH_FILTER] original edges = " << orig.image_pairs.size()
+              << ", edges_with_triplet_scale = " << cnt_triplet_edges
+              << ", filtered edges (triplet [+ MST if enabled]) = " << out->image_pairs.size();
+}
+
 void GlobalPositioner::ConvertResults(
     std::unordered_map<image_t, Image>& images) {
   for (auto& [image_id, image] : images) {
@@ -591,8 +717,8 @@ void GlobalPositioner::ConvertResults(
 
 void GlobalPositioner::PruneTracksWithRansacStats(
     std::unordered_map<track_t, Track>& tracks) const {
-  const double kMinLocalRatio  = 0.01;  // triplet RANSAC min_inlier ratio
-  const double kMinGlobalRatio = 0.01;  // edge RANSAC min_inlier ratio
+  const double kMinLocalRatio  = 0.0;  // triplet RANSAC min_inlier ratio
+  const double kMinGlobalRatio = 0.0;  // edge RANSAC min_inlier ratio
 
   int num_removed = 0;
   int num_total   = static_cast<int>(tracks.size());
@@ -687,35 +813,43 @@ void GlobalPositioner::PruneOrphanImagesAndTracks(
     }
   }
 
-  // 4) 각 트랙에서 orphan 이미지에 해당하는 observation 제거
-  for (auto it = tracks.begin(); it != tracks.end(); ) {
-    Track& tr = it->second;
-
-    // orphan에 붙은 obs 지우기
-    tr.observations.erase(
-        std::remove_if(tr.observations.begin(), tr.observations.end(),
-                       [&](const std::pair<image_t, feature_t>& obs) {
-                         return orphan_set.count(obs.first) > 0;
-                       }),
-        tr.observations.end());
-
-    // 남은 observation 수가 너무 적으면 트랙 자체 제거
-    if (tr.observations.size() < static_cast<size_t>(options_.min_num_view_per_track)) {
-      it = tracks.erase(it);
-    } else {
-      ++it;
-    }
-  }
-
-  // 5) orphan 이미지 지우기
-  int removed_imgs = 0;
+  // 3.5) orphan 이미지는 "아직 등록 안 된" 카메라로 표시
   for (image_t oid : orphan_set) {
     auto it = images.find(oid);
     if (it != images.end()) {
-      images.erase(it);
-      ++removed_imgs;
+      it->second.is_registered = false;
     }
   }
+
+  // // 4) 각 트랙에서 orphan 이미지에 해당하는 observation 제거
+  // for (auto it = tracks.begin(); it != tracks.end(); ) {
+  //   Track& tr = it->second;
+
+  //   // orphan에 붙은 obs 지우기
+  //   tr.observations.erase(
+  //       std::remove_if(tr.observations.begin(), tr.observations.end(),
+  //                      [&](const std::pair<image_t, feature_t>& obs) {
+  //                        return orphan_set.count(obs.first) > 0;
+  //                      }),
+  //       tr.observations.end());
+
+  //   // 남은 observation 수가 너무 적으면 트랙 자체 제거
+  //   if (tr.observations.size() < static_cast<size_t>(options_.min_num_view_per_track)) {
+  //     it = tracks.erase(it);
+  //   } else {
+  //     ++it;
+  //   }
+  // }
+
+  // // 5) orphan 이미지 지우기
+  // int removed_imgs = 0;
+  // for (image_t oid : orphan_set) {
+  //   auto it = images.find(oid);
+  //   if (it != images.end()) {
+  //     images.erase(it);
+  //     ++removed_imgs;
+  //   }
+  // }
 
   // 6) orphan에 붙은 edge들도 제거
   int removed_edges = 0;
@@ -732,8 +866,9 @@ void GlobalPositioner::PruneOrphanImagesAndTracks(
     }
   }
 
-  LOG(INFO) << "[ORPHAN_PRUNE] removed " << removed_imgs
-            << " orphan images, removed_edges = " << removed_edges
+  LOG(INFO) << "[ORPHAN_PRUNE] orphan images (kept for PnP) = "
+            << orphan_set.size()
+            << ", removed_edges = " << removed_edges
             << ", remaining images = " << images.size()
             << ", remaining tracks = " << tracks.size()
             << ", remaining edges = " << edge_scales.size();
@@ -976,7 +1111,7 @@ bool GlobalPositioner::EstimateSForTripletRansac(
 
   const int max_iters = options_.tri_ransac_max_iters;
   const double px_thr = options_.tri_inlier_px_thresh_local;
-  const double min_depth = options_.tri_min_depth;
+  const double tri_min_inlier_ratio = options_.tri_min_inlier_ratio;
 
   int best_inl = -1;
   Eigen::Vector3d best_s = Eigen::Vector3d::Zero();
@@ -1059,18 +1194,10 @@ bool GlobalPositioner::EstimateSForTripletRansac(
 
       Eigen::Vector3d lambda = A9.colPivHouseholderQr().solve(b9);
       if (!lambda.allFinite()) continue;
-      if (lambda(0) <= min_depth ||
-          lambda(1) <= min_depth ||
-          lambda(2) <= min_depth) {
-        continue;
-      }
 
       const Eigen::Vector3d Xi = lambda(0) * di2;       // cam-i
       const Eigen::Vector3d Xj = Rij * Xi + tij;        // cam-j
       const Eigen::Vector3d Xk = Rjk * Xj + tjk;        // cam-k
-      if (Xi.z() <= min_depth || Xj.z() <= min_depth || Xk.z() <= min_depth) {
-        continue;
-      }
 
       auto proj = [](const Eigen::Vector3d& X,
                      double fx, double fy, double cx, double cy) {
@@ -1107,7 +1234,16 @@ bool GlobalPositioner::EstimateSForTripletRansac(
   }  // RANSAC loop
 
   // RANSAC gating
-  if (best_inl < options_.tri_min_inliers) {
+  int denom = std::min<int>(
+      static_cast<int>(tids.size()),
+      options_.tri_max_score_tracks
+  );
+  double inlier_ratio = 0.0;
+  if (denom > 0) {
+    inlier_ratio = static_cast<double>(best_inl) / static_cast<double>(denom);
+  }
+
+  if (inlier_ratio < tri_min_inlier_ratio) {
     return false;
   }
 
@@ -1118,8 +1254,7 @@ bool GlobalPositioner::EstimateSForTripletRansac(
                      best_errs.end());
     median_err = best_errs[best_errs.size() / 2];
   }
-  const double kReprojFactor = 1.2;
-  if (median_err > kReprojFactor * px_thr) {
+  if (median_err > px_thr) {
     return false;
   }
 
@@ -1172,18 +1307,18 @@ bool GlobalPositioner::EstimateSForTripletRansac(
 
     Eigen::Vector3d lambda = A9.colPivHouseholderQr().solve(b9);
     if (!lambda.allFinite()) continue;
-    if (lambda(0) <= min_depth ||
-        lambda(1) <= min_depth ||
-        lambda(2) <= min_depth) {
-      continue;
-    }
+    // if (lambda(0) <= min_depth ||
+    //     lambda(1) <= min_depth ||
+    //     lambda(2) <= min_depth) {
+    //   continue;
+    // }
 
     const Eigen::Vector3d Xi = lambda(0) * di2;
     const Eigen::Vector3d Xj = Rij * Xi + tij_best;
     const Eigen::Vector3d Xk = Rjk * Xj + tjk_best;
-    if (Xi.z() <= min_depth || Xj.z() <= min_depth || Xk.z() <= min_depth) {
-      continue;
-    }
+    // if (Xi.z() <= min_depth || Xj.z() <= min_depth || Xk.z() <= min_depth) {
+    //   continue;
+    // }
 
     auto proj = [](const Eigen::Vector3d& X,
                    double fx, double fy, double cx, double cy) {
@@ -1222,8 +1357,12 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     const std::unordered_map<image_t, Image>& images,
     const std::unordered_map<track_t, Track>& tracks,
     const std::unordered_map<camera_t, Camera>& cameras,
-    std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales) {
+    std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales,
+    std::unordered_map<uint64_t, int>* edge_votes_out) {
   edge_scales.clear();
+
+  std::unordered_map<uint64_t, int> edge_votes;
+  edge_votes.reserve(tracks.size());
 
   // 1) Build local triplet -> tids map in O(#tracks * (#obs_in_track)^3)
   using TripletMap =
@@ -1246,7 +1385,6 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     for (int a = 0; a < n; ++a) {
       for (int b = a + 1; b < n; ++b) {
         for (int c = b + 1; c < n; ++c) {
-          if (emitted >= options_.tri_max_triplets_per_track) break;
 
           image_t ia = img_ids[a];
           image_t ib = img_ids[b];
@@ -1279,23 +1417,28 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     const std::vector<track_t>& tids3 = kv.second;
     ++num_triplets_total;
 
-    // Require a minimum number of supporting 3-view tracks.
-    if (static_cast<int>(tids3.size()) < options_.tri_min_inliers) {
-      continue;
-    }
-
     Eigen::Vector3d s_ijk;
     int best_inl = 0;
     double median_err = 0.0;
     std::vector<Eigen::Matrix3d> A_list;
 
-    if (EstimateSForTripletRansac(key.i, key.j, key.k,
+    const uint64_t e_ij = EdgeKey(key.i, key.j);
+    const uint64_t e_jk = EdgeKey(key.j, key.k);
+    const uint64_t e_ik = EdgeKey(key.i, key.k);
+
+    const bool ok = EstimateSForTripletRansac(key.i, key.j, key.k,
                                   tids3,
                                   view_graph, images, tracks, cameras,
                                   &s_ijk,
                                   &best_inl,
                                   &median_err,
-                                  &A_list)) {
+                                  &A_list);
+    if (ok) {
+      // triplet inlier → 각 edge에 +1
+      edge_votes[e_ij] += 1;
+      edge_votes[e_jk] += 1;
+      edge_votes[e_ik] += 1;
+
       if (!A_list.empty()) {
         ++num_triplets_success;
         for (const auto& A_local : A_list) {
@@ -1307,10 +1450,74 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
           constraints.push_back(std::move(tc));
         }
       }
+    } else {
+      // triplet outlier → 각 edge에 -1
+      edge_votes[e_ij] -= 1;
+      edge_votes[e_jk] -= 1;
+      edge_votes[e_ik] -= 1;
     }
   }
 
-  const double kMinEdgeScale = 1e-4;
+  // --- 통계용 변수들 ---
+  // const double kMinEdgeScale = 1e-4;
+  const int kMinEdgeVote = options_.min_thresh_edgevote;
+
+  int cnt_pos  = 0;
+  int cnt_zero = 0;
+  int cnt_neg  = 0;
+
+  int min_vote = std::numeric_limits<int>::max();
+  int max_vote = std::numeric_limits<int>::min();
+  long long sum_vote = 0;
+
+  for (const auto& kv_vote : edge_votes) {
+    const int v = kv_vote.second;
+    if (v > 0)      ++cnt_pos;
+    else if (v == 0) ++cnt_zero;
+    else            ++cnt_neg;
+
+    min_vote = std::min(min_vote, v);
+    max_vote = std::max(max_vote, v);
+    sum_vote += v;
+  }
+
+  const int edges_with_any_vote = static_cast<int>(edge_votes.size());
+  const int n_edges_vote        = edges_with_any_vote;
+  const double mean_vote = (n_edges_vote > 0)
+                            ? static_cast<double>(sum_vote) / n_edges_vote
+                            : 0.0;
+
+  // voting threshold 기준으로 몇 개를 살릴지/버릴지
+  int edges_kept_by_vote    = 0;
+  int edges_removed_by_vote = 0;
+  for (const auto& kv_vote : edge_votes) {
+    const int v = kv_vote.second;
+    if (v >= kMinEdgeVote) ++edges_kept_by_vote;
+    else                   ++edges_removed_by_vote;
+  }
+
+  const int num_edges_after_relpose =
+      static_cast<int>(view_graph.image_pairs.size());
+
+  LOG(INFO) << "[TRI_RANSAC][EDGE_VOTES] "
+            << "edges_after_relpose=" << num_edges_after_relpose
+            << ", edges_with_any_vote=" << edges_with_any_vote
+            << ", edges_kept_by_vote=" << edges_kept_by_vote
+            << ", edges_removed_by_vote=" << edges_removed_by_vote
+            << " (kMinEdgeVote=" << kMinEdgeVote << ") "
+            << ", pos=" << cnt_pos
+            << ", zero=" << cnt_zero
+            << ", neg=" << cnt_neg
+            << ", min=" << min_vote
+            << ", max=" << max_vote
+            << ", mean=" << mean_vote;
+
+  auto is_good_edge = [&](uint64_t key) {
+    auto it = edge_votes.find(key);
+    if (it == edge_votes.end()) return false;
+    return it->second >= kMinEdgeVote;
+  };
+
 
   LOG(INFO) << "[TRI_RANSAC] triplets (unique) = " << num_triplets_total
             << ", success = " << num_triplets_success
@@ -1327,8 +1534,9 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     return;
   }
 
-  // 2) Build global linear system: Aglob * s ≈ 0
-  //    - each (i,j,k, A_local) adds 3 rows and touches 3 edge variables.
+  // 2) Build normal matrix N = Aglob^T * Aglob directly
+  //    - we never form Aglob explicitly.
+  //    - each (i,j,k, A_local) adds a 3x3 block A_local^T A_local to N.
   struct GlobalConstraint {
     int e_ij;
     int e_jk;
@@ -1357,6 +1565,12 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     const uint64_t key_jk = EdgeKey(tc.j, tc.k);
     const uint64_t key_ik = EdgeKey(tc.i, tc.k);
 
+    if (!is_good_edge(key_ij) ||
+        !is_good_edge(key_jk) ||
+        !is_good_edge(key_ik)) {
+      continue;
+    }
+
     GlobalConstraint gc;
     gc.e_ij = get_edge_id(key_ij);
     gc.e_jk = get_edge_id(key_jk);
@@ -1365,10 +1579,19 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     gconstraints.push_back(std::move(gc));
   }
 
+
+  const int num_edges_in_LS = static_cast<int>(edge_to_id.size());
+
+  LOG(INFO) << "[TRI_RANSAC][GLOBAL_LS_EDGES] "
+            << "edges_kept_by_vote=" << edges_kept_by_vote
+            << ", edges_used_in_LS=" << num_edges_in_LS
+            << ", kept_but_unused="
+            << (edges_kept_by_vote - num_edges_in_LS);
+
   const int num_edges = static_cast<int>(edge_to_id.size());
   const int num_rows  = 3 * static_cast<int>(gconstraints.size());
 
-  LOG(INFO) << "[GLOBAL_LS] A size: " << num_rows << " x " << num_edges
+  LOG(INFO) << "[GLOBAL_LS] A size (conceptual): " << num_rows << " x " << num_edges
             << " (rows = 3 * #constraints, cols = #edges)";
 
   if (num_edges == 0) {
@@ -1376,54 +1599,182 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     return;
   }
 
-  Eigen::MatrixXd Aglob(num_rows, num_edges);
-  Aglob.setZero();
+  // N = Aglob^T * Aglob, but built incrementally.
+  // size: num_edges x num_edges (e.g., 310 x 310).
+  Eigen::MatrixXd N(num_edges, num_edges);
+  N.setZero();
 
-  for (int idx = 0; idx < static_cast<int>(gconstraints.size()); ++idx) {
-    const int r = 3 * idx;
-    const auto& gc = gconstraints[idx];
-    // Note: A_local is 3x3; each column corresponds to one of (s_ij, s_jk, s_ik).
-    Aglob.block<3,1>(r, gc.e_ij) = gc.A_local.col(0);
-    Aglob.block<3,1>(r, gc.e_jk) = gc.A_local.col(1);
-    Aglob.block<3,1>(r, gc.e_ik) = gc.A_local.col(2);
+  // For each constraint, local contribution is:
+  //   ||A_local * s_triplet||^2 = s_triplet^T (A_local^T A_local) s_triplet
+  // with s_triplet = [s_ij, s_jk, s_ik]^T.
+  // So we accumulate M = A_local^T A_local into N at indices (e_ij, e_jk, e_ik).
+  for (const auto& gc : gconstraints) {
+    const int i = gc.e_ij;
+    const int j = gc.e_jk;
+    const int k = gc.e_ik;
+
+    const Eigen::Matrix3d M = gc.A_local.transpose() * gc.A_local;  // 3x3, symmetric
+
+    // (0,0), (0,1), (0,2)
+    N(i, i) += M(0, 0);
+    N(i, j) += M(0, 1);
+    N(i, k) += M(0, 2);
+
+    // (1,0), (1,1), (1,2)
+    N(j, i) += M(1, 0);
+    N(j, j) += M(1, 1);
+    N(j, k) += M(1, 2);
+
+    // (2,0), (2,1), (2,2)
+    N(k, i) += M(2, 0);
+    N(k, j) += M(2, 1);
+    N(k, k) += M(2, 2);
   }
 
-  // 3) Solve Aglob * s ≈ 0 using SVD: smallest singular value gives the nullspace.
-  Eigen::JacobiSVD<Eigen::MatrixXd> svd(
-      Aglob, Eigen::ComputeThinV);
-  const Eigen::VectorXd singular_values = svd.singularValues();
-  Eigen::VectorXd s_global = svd.matrixV().col(num_edges - 1);
+  // 3) Solve N * s = λ s (smallest eigenvalue) to get nullspace of Aglob.
+  // N = Aglob^T Aglob ⇒ eigenvalues of N are squared singular values of Aglob.
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(N);
+  if (eig.info() != Eigen::Success) {
+    LOG(ERROR) << "[GLOBAL_LS] Eigen decomposition failed.";
+    return;
+  }
 
-  if (singular_values.size() >= 2) {
-    const int n = static_cast<int>(singular_values.size());
-    const double sigma_min     = singular_values(n - 1);     // smallest
-    const double sigma_second  = singular_values(n - 2);     // second smallest
+  const Eigen::VectorXd eigen_values = eig.eigenvalues();
+  // Eigen sorts ascending: λ0 ≤ λ1 ≤ ... ≤ λ_{n-1}
+  // smallest eigenvalue eigenvector = nullspace direction.
+  Eigen::VectorXd s_global = eig.eigenvectors().col(0);
+
+  if (eigen_values.size() >= 2) {
+    const double lambda_min    = eigen_values(0);
+    const double lambda_second = eigen_values(1);
+
+    // (optional) interpret as singular values of Aglob
+    const double sigma_min    = std::sqrt(std::max(0.0, lambda_min));
+    const double sigma_second = std::sqrt(std::max(0.0, lambda_second));
     const double gap_ratio =
-        (sigma_min > 0.0) ? (sigma_second / sigma_min)
-                          : std::numeric_limits<double>::infinity();
-    LOG(INFO) << "[GLOBAL_LS] nullspace gap: "
-              << "sigma[n-2] = " << sigma_second
-              << ", sigma[n-1] = " << sigma_min
+        (sigma_min > 0.0)
+            ? (sigma_second / sigma_min)
+            : std::numeric_limits<double>::infinity();
+
+    LOG(INFO) << "[GLOBAL_LS] nullspace gap (from N = A^T A): "
+              << "lambda[0] = " << lambda_min
+              << ", lambda[1] = " << lambda_second
+              << ", sigma_min = " << sigma_min
+              << ", sigma_second = " << sigma_second
               << ", ratio = " << gap_ratio;
   }
 
-  // 4) Normalize s_global by reference edge id (e.g., 0)
-  int ref_eid = 0;
-  double ref = s_global(ref_eid);
-  // If reference is near zero, pick another non-zero entry
-  if (std::abs(ref) < 1e-9) {
-    for (int e = 0; e < s_global.size(); ++e) {
-      if (std::abs(s_global(e)) > 1e-9) {
-        ref_eid = e;
-        ref = s_global(e);
-        break;
+  
+  // 4) Normalize s_global using an edge incident to the most-connected image
+  //    (same degree-based root heuristic as InitializeCamerasFromTriScales).
+  int    ref_eid = 0;
+  double ref     = 1.0;
+
+  if (num_edges > 0) {
+    // 1) Compute node degrees from LS edges.
+    std::unordered_map<image_t, int> node_degree;
+    node_degree.reserve(num_edges * 2);
+    for (const auto& kv_edge : edge_to_id) {
+      const uint64_t ekey = kv_edge.first;
+      const image_t u = static_cast<image_t>(ekey >> 32);
+      const image_t v = static_cast<image_t>(ekey & 0xffffffff);
+      node_degree[u]++;
+      node_degree[v]++;
+    }
+
+    // 2) Pick root node: the node with the largest degree.
+    image_t root_id = 0;
+    int     root_deg = -1;
+    for (const auto& kv_deg : node_degree) {
+      if (kv_deg.second > root_deg) {
+        root_deg = kv_deg.second;
+        root_id  = kv_deg.first;
       }
     }
-    if (std::abs(ref) < 1e-9) {
-      ref = 1.0;  // degenerate fallback
+
+    // 3) Among edges incident to root_id, pick the one whose neighbor
+    //    has the largest degree (tie-break by |s_global|).
+    int    best_neighbor_deg = -1;
+    double best_abs          = 0.0;
+    int    best_eid          = -1;
+    image_t best_neighbor_id = 0;
+
+    for (const auto& kv_edge : edge_to_id) {
+      const uint64_t ekey = kv_edge.first;
+      const int      eid  = kv_edge.second;
+
+      const image_t u = static_cast<image_t>(ekey >> 32);
+      const image_t v = static_cast<image_t>(ekey & 0xffffffff);
+
+      // Only consider edges incident to root_id.
+      if (u != root_id && v != root_id) {
+        continue;
+      }
+
+      // neighbor = the other endpoint
+      const image_t nbr = (u == root_id) ? v : u;
+
+      // If neighbor has no degree entry (should not happen), skip.
+      auto it_deg = node_degree.find(nbr);
+      if (it_deg == node_degree.end()) {
+        continue;
+      }
+      const int nbr_deg = it_deg->second;
+
+      const double val = s_global(eid);
+      const double a   = std::abs(val);
+
+      // Prefer larger neighbor degree, tie-break by larger |s_global|.
+      if (nbr_deg > best_neighbor_deg ||
+          (nbr_deg == best_neighbor_deg && a > best_abs)) {
+        best_neighbor_deg = nbr_deg;
+        best_abs          = a;
+        best_eid          = eid;
+        best_neighbor_id  = nbr;
+      }
     }
+
+    if (best_eid >= 0) {
+      ref_eid = best_eid;
+      ref     = s_global(ref_eid);
+      LOG(INFO) << "[GLOBAL_LS] root_id = " << root_id
+                << ", root_deg = " << root_deg
+                << ", neighbor_id = " << best_neighbor_id
+                << ", neighbor_deg = " << best_neighbor_deg;
+    } else {
+      // Fallback: if for some reason no edge incident to root was found,
+      // use globally largest |s_global|.
+      double global_best_abs = 0.0;
+      int    global_best_eid = 0;
+      for (int e = 0; e < s_global.size(); ++e) {
+        double a = std::abs(s_global(e));
+        if (a > global_best_abs) {
+          global_best_abs = a;
+          global_best_eid = e;
+        }
+      }
+      ref_eid = global_best_eid;
+      ref     = s_global(ref_eid);
+
+      LOG(INFO) << "[GLOBAL_LS] fallback: using globally largest |s_global|";
+    }
+
+    // 4) If ref is too small, treat as degenerate and clamp its magnitude.
+    // if (std::abs(ref) < 1e-4) {
+    //   ref = (ref >= 0.0 ? 1.0 : -1.0);
+    // }
+
+    // 5) Enforce positive reference so that final scales are mostly positive.
+    if (ref < 0.0) {
+      s_global = -s_global;
+      ref      = -ref;
+    }
+
+    LOG(INFO) << "[GLOBAL_LS] scale normalization ref_eid = "
+              << ref_eid << ", ref_s = " << ref;
   }
-  // Normalize so that s_global[ref_eid] == 1
+
+  // Normalize so that s_global[ref_eid] == 1.
   s_global /= ref;
 
   // 5) Build edge scales and simple support counts.
@@ -1436,17 +1787,11 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
 
   int num_edges_before = num_edges;
   int num_edges_after  = 0;
-  int num_edges_removed_by_scale = 0;
 
   for (const auto& kv : edge_to_id) {
     const uint64_t ekey = kv.first;
     const int eid = kv.second;
     const double s_val = std::abs(s_global(eid));
-
-    if (s_val < kMinEdgeScale) {
-      ++num_edges_removed_by_scale;
-      continue;
-    }
 
     EdgeScaleSample sample;
     sample.s          = s_val;
@@ -1457,10 +1802,9 @@ void GlobalPositioner::EstimateEdgeScalesByTriRansac(
     ++num_edges_after;
   }
 
-  LOG(INFO) << "[GLOBAL_LS] edges (unique) before = " << num_edges_before
-            << ", after scale-threshold = " << num_edges_after
-            << ", removed_by_scale = " << num_edges_removed_by_scale
-            << " (thres=" << kMinEdgeScale << ")";
+  if (edge_votes_out) {
+    *edge_votes_out = std::move(edge_votes);
+  }
 
   if (VLOG_IS_ON(2)) {
     for (const auto& kv : edge_scales) {
@@ -1514,8 +1858,6 @@ void GlobalPositioner::FilterEdgeScalesWithTriplet(
     for (int a = 0; a < n; ++a) {
       for (int b = a + 1; b < n; ++b) {
         for (int c = b + 1; c < n; ++c) {
-          if (emitted >= options_.tri_max_triplets_per_track) break;
-
           image_t ia = img_ids[a];
           image_t ib = img_ids[b];
           image_t ic = img_ids[c];
@@ -1538,9 +1880,7 @@ void GlobalPositioner::FilterEdgeScalesWithTriplet(
   //    inlier counts and error sums.
   // ------------------------------------------------------------------
   const double px_thr    = options_.tri_inlier_px_thresh_global;
-  const double min_depth = options_.tri_min_depth;
-  const int    min_edge_support = options_.tri_min_inliers_global;
-  const double min_inlier_ratio = 0.1;
+  const double min_inlier_ratio = options_.tri_min_inlier_ratio_global;
 
   std::unordered_map<uint64_t, int>    edge_inliers;
   std::unordered_map<uint64_t, double> edge_err_sum;
@@ -1661,18 +2001,10 @@ void GlobalPositioner::FilterEdgeScalesWithTriplet(
 
       Eigen::Vector3d lambda = A9.colPivHouseholderQr().solve(b9);
       if (!lambda.allFinite()) continue;
-      if (lambda(0) <= min_depth ||
-          lambda(1) <= min_depth ||
-          lambda(2) <= min_depth) {
-        continue;
-      }
 
       const Eigen::Vector3d Xi = lambda(0) * di;
       const Eigen::Vector3d Xj = Rij * Xi + tij;
       const Eigen::Vector3d Xk = Rjk * Xj + tjk;
-      if (Xi.z() <= min_depth || Xj.z() <= min_depth || Xk.z() <= min_depth) {
-        continue;
-      }
 
       const Eigen::Vector2d pi = proj(Xi, fix, fiy, cix, ciy);
       const Eigen::Vector2d pj = proj(Xj, fjx, fjy, cjx, cjy);
@@ -1720,7 +2052,7 @@ void GlobalPositioner::FilterEdgeScalesWithTriplet(
   // ------------------------------------------------------------------
   int num_edges_before = static_cast<int>(edge_scales.size());
   int num_edges_removed = 0;
-  const double kMaxScale = 15.0;  // Prune edges with too large scale.
+  const double kMaxScale = options_.tri_inlier_max_scale; // Prune edges with too large scale.
 
     for (auto it = edge_scales.begin(); it != edge_scales.end(); ) {
       const uint64_t key = it->first;
@@ -1737,7 +2069,6 @@ void GlobalPositioner::FilterEdgeScalesWithTriplet(
       }
 
       const bool remove_edge =
-          (inl < min_edge_support) ||
           (inlier_ratio < min_inlier_ratio) ||
           (s_val > kMaxScale);
 
@@ -1760,8 +2091,7 @@ void GlobalPositioner::FilterEdgeScalesWithTriplet(
     LOG(INFO) << "[EDGE_FILTERING] edges before = " << num_edges_before
               << ", after = " << num_edges_after
               << ", removed = " << num_edges_removed
-              << " (support < " << min_edge_support
-              << " or inlier_ratio < " << min_inlier_ratio
+              << " (inlier_ratio < " << min_inlier_ratio
               << " or scale > " << kMaxScale << ")";
 }
 
@@ -1843,8 +2173,64 @@ void GlobalPositioner::InitializeCamerasFromTriScales(
 
   int num_backbone_components = 0;
   int num_backbone_nodes = 0;
+  bool first_root_logged = false;
 
-  // We may have multiple connected components in the good graph.
+  // 2-0) good_adj에서 degree가 가장 큰 image를 하나 골라서
+  //      "글로벌 루트"로 사용 (가장 edge가 많이 연결된 image).
+  if (!good_adj.empty()) {
+    image_t best_root = good_adj.begin()->first;
+    size_t best_deg   = good_adj.begin()->second.size();
+
+    for (const auto& kv : good_adj) {
+      const image_t img_id = kv.first;
+      const size_t deg     = kv.second.size();
+      if (deg > best_deg) {
+        best_deg   = deg;
+        best_root  = img_id;
+      }
+    }
+
+    // 첫 번째 backbone component는 best_root에서 시작
+    {
+      ++num_backbone_components;
+
+      images[best_root].cam_from_world.translation.setZero();
+      visited.insert(best_root);
+      q.push(best_root);
+      ++num_backbone_nodes;
+
+      while (!q.empty()) {
+        const image_t u = q.front();
+        q.pop();
+
+        const auto it_adj = good_adj.find(u);
+        if (it_adj == good_adj.end()) {
+          continue;
+        }
+
+        for (const Neighbor& nb : it_adj->second) {
+          const image_t v = nb.first;
+          const double s_uv = nb.second;
+          if (visited.count(v)) continue;
+
+          Eigen::Vector3d dir_w;
+          if (!GetWorldDirection(view_graph, images, u, v, &dir_w)) {
+            dir_w = Eigen::Vector3d(1, 0, 0);
+          }
+
+          images[v].cam_from_world.translation =
+              images[u].cam_from_world.translation + s_uv * dir_w;
+
+          visited.insert(v);
+          q.push(v);
+          ++num_backbone_nodes;
+        }
+      }
+    }
+  }
+
+  // 2-1) 나머지 컴포넌트들은 기존처럼, 아직 방문 안 된 노드 중
+  //      good_adj에 있는 애들을 루트로 해서 BFS.
   for (auto& [image_id, image] : images) {
     if (visited.count(image_id)) continue;
     if (good_adj.find(image_id) == good_adj.end()) {
@@ -1852,12 +2238,13 @@ void GlobalPositioner::InitializeCamerasFromTriScales(
       continue;
     }
 
-    // Start a new backbone component from this image.
+    if (!first_root_logged) {
+      LOG(INFO) << "[TRI_RANSAC] backbone first root image_id = " << image_id;
+      first_root_logged = true;
+    }
+
     ++num_backbone_components;
 
-    // For each component, we set its root translation to zero.
-    // Different components are not aligned to each other yet; BA will
-    // handle the global gauge freedoms later.
     image.cam_from_world.translation.setZero();
     visited.insert(image_id);
     q.push(image_id);
@@ -1879,7 +2266,6 @@ void GlobalPositioner::InitializeCamerasFromTriScales(
 
         Eigen::Vector3d dir_w;
         if (!GetWorldDirection(view_graph, images, u, v, &dir_w)) {
-          // Fallback direction if the relative pose is missing or invalid.
           dir_w = Eigen::Vector3d(1, 0, 0);
         }
 
@@ -1918,6 +2304,335 @@ void GlobalPositioner::InitializeCamerasFromTriScales(
             << num_uninitialized
             << " / " << num_total;
 }
+
+// void GlobalPositioner::InitializeCamerasFromTriScales(
+//       const ViewGraph& view_graph,
+//       std::unordered_map<image_t, Image>& images,
+//       const std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales) {
+//   if (images.empty()) return;
+
+//   using Neighbor = std::pair<image_t, double>;  // (neighbor id, best scale)
+
+//   // ------------------------------------------------------------------
+//   // 1) Build adjacency using only edges that have triplet-based scales.
+//   //    Also collect all such edges into a flat list for later.
+//   // ------------------------------------------------------------------
+//   std::unordered_map<image_t, std::vector<Neighbor>> good_adj;
+//   good_adj.reserve(images.size());
+
+//   struct EdgeConstraint {
+//     image_t u, v;
+//     double s_uv;
+//   };
+//   std::vector<EdgeConstraint> all_constraints;
+//   all_constraints.reserve(edge_scales.size());
+
+//   for (const auto& [pair_id, ipair] : view_graph.image_pairs) {
+//     if (!ipair.is_valid) continue;
+
+//     const image_t u = ipair.image_id1;
+//     const image_t v = ipair.image_id2;
+//     const uint64_t key = EdgeKey(u, v);
+
+//     auto it_s = edge_scales.find(key);
+//     if (it_s == edge_scales.end() || it_s->second.empty()) {
+//       // No triplet-based scale for this edge -> ignore it.
+//       continue;
+//     }
+
+//     const auto& samples = it_s->second;
+
+//     // Select the best sample based on (inliers, -median_err).
+//     const EdgeScaleSample* best = &samples[0];
+//     for (const auto& es : samples) {
+//       if (es.inliers > best->inliers) {
+//         best = &es;
+//       } else if (es.inliers == best->inliers &&
+//                  es.median_err < best->median_err) {
+//         best = &es;
+//       }
+//     }
+
+//     const double s_uv = best->s;
+//     if (s_uv <= 0.0) {
+//       // Just in case, ignore non-positive scales.
+//       continue;
+//     }
+
+//     good_adj[u].emplace_back(v, s_uv);
+//     good_adj[v].emplace_back(u, s_uv);
+
+//     EdgeConstraint c;
+//     c.u    = u;
+//     c.v    = v;
+//     c.s_uv = s_uv;
+//     all_constraints.push_back(c);
+//   }
+
+//   // If there is no edge with triplet-based scale, mark all images as orphan.
+//   if (good_adj.empty()) {
+//     orphan_images_.clear();
+//     orphan_images_.reserve(images.size());
+//     for (const auto& kv : images) {
+//       orphan_images_.push_back(kv.first);
+//     }
+
+//     LOG(INFO) << "[TRI_RANSAC] backbone components (good edges only) = 0"
+//               << ", backbone cameras = 0";
+//     LOG(INFO) << "[TRI_RANSAC] orphan cameras (not in triplet backbone) = "
+//               << orphan_images_.size()
+//               << " / " << images.size();
+//     return;
+//   }
+
+//   // For statistics: pick a global-most-connected node (not strictly required).
+//   image_t global_best_root = good_adj.begin()->first;
+//   size_t  global_best_deg  = good_adj.begin()->second.size();
+//   for (const auto& kv : good_adj) {
+//     if (kv.second.size() > global_best_deg) {
+//       global_best_deg  = kv.second.size();
+//       global_best_root = kv.first;
+//     }
+//   }
+
+//   // ------------------------------------------------------------------
+//   // 2) For each connected component in good_adj, build a linear
+//   //    least-squares system:
+//   //
+//   //         C_v - C_u = s_uv * dir_w(u->v)
+//   //
+//   //    where dir_w is the relative direction in world frame.
+//   //    Fix one node per component (root) at 0 to remove gauge.
+//   // ------------------------------------------------------------------
+//   std::unordered_set<image_t> visited;    // used only for BFS to find components
+//   visited.reserve(images.size());
+
+//   std::unordered_set<image_t> positioned; // nodes for which we successfully solved centers
+//   positioned.reserve(images.size());
+
+//   int  num_backbone_components = 0;
+//   int  num_backbone_nodes      = 0;
+//   bool first_root_logged       = false;
+
+//   for (const auto& kv : good_adj) {
+//     const image_t start = kv.first;
+//     if (visited.count(start)) continue;
+
+//     // ---- 2-1) BFS to collect all nodes in this connected component. ----
+//     std::vector<image_t> component_nodes;
+//     component_nodes.reserve(64);
+
+//     std::queue<image_t> q;
+//     q.push(start);
+//     visited.insert(start);
+
+//     while (!q.empty()) {
+//       image_t u = q.front();
+//       q.pop();
+//       component_nodes.push_back(u);
+
+//       auto it_adj = good_adj.find(u);
+//       if (it_adj == good_adj.end()) continue;
+//       for (const Neighbor& nb : it_adj->second) {
+//         const image_t v = nb.first;
+//         if (visited.count(v)) continue;
+//         visited.insert(v);
+//         q.push(v);
+//       }
+//     }
+
+//     if (component_nodes.size() < 2) {
+//       // Component of a single node with no edges; no backbone contribution.
+//       continue;
+//     }
+
+//     // ---- 2-2) Choose a root in this component: node with max degree. ----
+//     image_t root_id = component_nodes[0];
+//     size_t  best_deg = 0;
+//     for (image_t nid : component_nodes) {
+//       auto it_adj = good_adj.find(nid);
+//       size_t deg = (it_adj != good_adj.end()) ? it_adj->second.size() : 0;
+//       if (deg > best_deg) {
+//         best_deg = deg;
+//         root_id  = nid;
+//       }
+//     }
+
+//     // ---- 2-3) Collect edges that lie entirely inside this component. ----
+//     std::unordered_set<image_t> node_set(component_nodes.begin(),
+//                                          component_nodes.end());
+
+//     struct LocalEdge {
+//       image_t u, v;
+//       double  s_uv;
+//     };
+//     std::vector<LocalEdge> comp_edges;
+//     comp_edges.reserve(component_nodes.size() * 2);
+
+//     for (const EdgeConstraint& e : all_constraints) {
+//       if (node_set.count(e.u) && node_set.count(e.v)) {
+//         LocalEdge le;
+//         le.u    = e.u;
+//         le.v    = e.v;
+//         le.s_uv = e.s_uv;
+//         comp_edges.push_back(le);
+//       }
+//     }
+
+//     if (comp_edges.empty()) {
+//       // No usable edge inside this component -> treated as orphans later.
+//       continue;
+//     }
+
+//     // ---- 2-4) Build unknown index for all non-root nodes (root is fixed to 0). ----
+//     std::unordered_map<image_t, int> index;
+//     index.reserve(component_nodes.size());
+//     int var_cnt = 0;
+//     for (image_t nid : component_nodes) {
+//       if (nid == root_id) continue;
+//       index[nid] = var_cnt++;
+//     }
+//     const int num_vars = 3 * var_cnt;
+//     if (num_vars == 0) {
+//       // Component consists only of root (no other node); still set root to zero.
+//       images[root_id].cam_from_world.translation.setZero();
+//       positioned.insert(root_id);
+//       ++num_backbone_components;
+//       num_backbone_nodes += 1;
+//       continue;
+//     }
+
+//     // ---- 2-5) Build linear system A x = rhs for this component. ----
+//     // For each edge (u, v) with direction dir_w, we add:
+//     //   C_v - C_u = s_uv * dir_w
+//     // as three scalar equations (for x,y,z).
+//     std::vector<Eigen::Triplet<double>> triplets;
+//     triplets.reserve(9 * comp_edges.size());  // rough guess: 3 rows * (u,v) variables
+
+//     Eigen::VectorXd rhs(3 * comp_edges.size());
+//     rhs.setZero();
+
+//     int row = 0;
+//     for (const auto& e : comp_edges) {
+//       Eigen::Vector3d dir_w;
+//       if (!GetWorldDirection(view_graph, images, e.u, e.v, &dir_w)) {
+//         // If direction cannot be computed, skip this edge.
+//         continue;
+//       }
+
+//       for (int k = 0; k < 3; ++k) {
+//         // Row index for this scalar equation.
+//         const int r = row;
+
+//         // Coefficient for C_u: -1
+//         if (e.u != root_id) {
+//           auto it_u = index.find(e.u);
+//           if (it_u != index.end()) {
+//             const int uid = it_u->second;
+//             triplets.emplace_back(r, 3 * uid + k, -1.0);
+//           }
+//         }
+//         // Coefficient for C_v: +1
+//         if (e.v != root_id) {
+//           auto it_v = index.find(e.v);
+//           if (it_v != index.end()) {
+//             const int vid = it_v->second;
+//             triplets.emplace_back(r, 3 * vid + k, +1.0);
+//           }
+//         }
+
+//         rhs(r) = e.s_uv * dir_w[k];
+//         ++row;
+//       }
+//     }
+
+//     const int num_rows = row;
+//     if (num_rows == 0) {
+//       // No valid direction constraints in this component -> treat as orphans.
+//       continue;
+//     }
+//     rhs.conservativeResize(num_rows);
+
+//     Eigen::SparseMatrix<double> A(num_rows, num_vars);
+//     A.setFromTriplets(triplets.begin(), triplets.end());
+
+//     // ---- 2-6) Solve normal equations (A^T A) x = A^T rhs via LDLT. ----
+//     Eigen::SparseMatrix<double> AtA = A.transpose() * A;
+//     Eigen::VectorXd              Atb = A.transpose() * rhs;
+
+//     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+//     solver.compute(AtA);
+//     if (solver.info() != Eigen::Success) {
+//       LOG(WARNING) << "[TRI_RANSAC][LS] LDLT decomposition failed for component. "
+//                       "Centers for this component remain uninitialized (treated as orphans).";
+//       continue;
+//     }
+
+//     Eigen::VectorXd x = solver.solve(Atb);
+//     if (solver.info() != Eigen::Success) {
+//       LOG(WARNING) << "[TRI_RANSAC][LS] solve failed for component. "
+//                       "Centers for this component remain uninitialized (treated as orphans).";
+//       continue;
+//     }
+
+//     // ---- 2-7) Recover camera centers from solution x. ----
+//     images[root_id].cam_from_world.translation.setZero();
+//     positioned.insert(root_id);
+
+//     for (image_t nid : component_nodes) {
+//       if (nid == root_id) continue;
+//       auto it_idx = index.find(nid);
+//       if (it_idx == index.end()) continue;
+
+//       const int id = it_idx->second;
+//       Eigen::Vector3d C;
+//       C.x() = x(3 * id + 0);
+//       C.y() = x(3 * id + 1);
+//       C.z() = x(3 * id + 2);
+
+//       images[nid].cam_from_world.translation = C;
+//       positioned.insert(nid);
+//     }
+
+//     // Log the first successful root for debugging/inspection.
+//     if (!first_root_logged) {
+//       LOG(INFO) << "[TRI_RANSAC] backbone first root image_id = "
+//                 << root_id
+//                 << " (global_best_root = " << global_best_root
+//                 << ", deg = " << best_deg << ")";
+//       first_root_logged = true;
+//     }
+
+//     ++num_backbone_components;
+//     num_backbone_nodes += static_cast<int>(component_nodes.size());
+//   }
+
+//   LOG(INFO) << "[TRI_RANSAC] backbone components (good edges only, LS-based) = "
+//             << num_backbone_components
+//             << ", backbone cameras = " << num_backbone_nodes;
+
+//   // ------------------------------------------------------------------
+//   // 3) Any image that did not receive a LS-initialized center is
+//   //    considered an orphan for later PnP refinement.
+//   // ------------------------------------------------------------------
+//   orphan_images_.clear();
+//   orphan_images_.reserve(images.size());
+
+//   for (const auto& kv : images) {
+//     const image_t img_id = kv.first;
+//     if (positioned.count(img_id) == 0) {
+//       orphan_images_.push_back(img_id);
+//     }
+//   }
+
+//   const size_t num_total        = images.size();
+//   const size_t num_uninitialized = orphan_images_.size();
+
+//   LOG(INFO) << "[TRI_RANSAC] orphan cameras (not in LS triplet backbone) = "
+//             << num_uninitialized
+//             << " / " << num_total;
+// }
+
 
 void GlobalPositioner::InitializePointsFromCameras(
       std::unordered_map<camera_t, Camera>& cameras,

@@ -105,20 +105,17 @@ struct GlobalPositionerOptions : public OptimizationBaseOptions {
   TriConsensusMetric tri_consensus_metric = PIXEL_REPROJ;
 
   // Maximum RANSAC iterations per triplet.
-  int tri_ransac_max_iters = 200;
-  int tri_max_score_tracks = 5000;
-  // Minimum number of inliers for accepting a triplet model.
-  int tri_min_inliers = 10;
-  // Maximum number of (i,j,k) triplets emitted per track.
-  int tri_max_triplets_per_track = 60;
-  // Minimum depth during 3-view depth solve.
-  double tri_min_depth = 1e-6;
-  // Inlier threshold for ANGULAR metric (degrees, per view).
-  double tri_inlier_ang_thresh_deg = 3.0;
+  int tri_ransac_max_iters = 100;
+  int tri_max_score_tracks = 1000;
+  // Minimum inlier ratio for accepting a triplet model.
+  double tri_min_inlier_ratio = 0.3;
   // Inlier threshold for PIXEL_REPROJ / SAMPSON (pixels, per pair/view).
-  double tri_inlier_px_thresh_local = 5.0;
-  int tri_min_inliers_global = 8;
-  double tri_inlier_px_thresh_global = 4.0;
+  double tri_inlier_px_thresh_local = 2.0;
+  int min_thresh_edgevote = -15;
+  // Filtering threshold for accepting global triplet hypotheses.
+  double tri_min_inlier_ratio_global = 0.3;
+  double tri_inlier_px_thresh_global = 2.0;
+  double tri_inlier_max_scale = 50.0;
 
   GlobalPositionerOptions() : OptimizationBaseOptions() {
     // Default robust loss for global positioning.
@@ -230,7 +227,8 @@ class GlobalPositioner {
       const std::unordered_map<image_t, Image>& images,
       const std::unordered_map<track_t, Track>& tracks,
       const std::unordered_map<camera_t, Camera>& cameras,
-      std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales);
+      std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales,
+      std::unordered_map<uint64_t, int>* edge_votes_out);
   
   void FilterEdgeScalesWithTriplet(
     const ViewGraph& view_graph,
@@ -259,6 +257,16 @@ class GlobalPositioner {
       std::unordered_map<image_t, Image>& images,
       std::unordered_map<track_t, Track>& tracks);
 
+  std::unordered_set<uint64_t> BuildMSTEdges(
+      const ViewGraph& view_graph,
+      const std::unordered_map<uint64_t, int>& edge_votes) const;
+
+  void BuildFilteredViewGraphWithMST(
+      const ViewGraph& orig,
+      const std::unordered_map<uint64_t, std::vector<EdgeScaleSample>>& edge_scales,
+      const std::unordered_map<uint64_t, int>& edge_votes,
+      ViewGraph* out) const;
+
   // ---------------------------------------------------------------------------
 
   GlobalPositionerOptions options_;
@@ -282,6 +290,7 @@ class GlobalPositioner {
   std::shared_ptr<ceres::LossFunction> loss_function_edge_scale_;
   std::unordered_map<track_t, TrackRansacStats> track_ransac_stats_;
   std::vector<image_t> orphan_images_;
+  image_t backbone_root_image_;
 
   // Keep track of residual blocks for different terms.
   std::vector<ceres::ResidualBlockId> residual_ids_ptcam_;       // 1st term

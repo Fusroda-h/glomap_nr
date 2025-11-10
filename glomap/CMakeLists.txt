@@ -9,6 +9,7 @@ set(SOURCES
     estimators/gravity_refinement.cc
     estimators/relpose_estimation.cc
     estimators/view_graph_calibration.cc
+    estimators/global_pnp.cc
     io/colmap_converter.cc
     io/colmap_io.cc
     io/gravity_io.cc
@@ -38,6 +39,7 @@ set(HEADERS
     estimators/relpose_estimation.h
     estimators/optimization_base.h
     estimators/view_graph_calibration.h
+    estimators/global_pnp.h
     io/colmap_converter.h
     io/colmap_io.h
     io/gravity_io.h

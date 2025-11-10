@@ -7,6 +7,7 @@
 #include "glomap/estimators/global_rotation_averaging.h"
 #include "glomap/estimators/relpose_estimation.h"
 #include "glomap/estimators/view_graph_calibration.h"
+#include "glomap/estimators/global_pnp.h"
 #include "glomap/types.h"
 
 #include <colmap/scene/database.h>
@@ -22,6 +23,7 @@ struct GlobalMapperOptions {
   GlobalPositionerOptions opt_gp;
   BundleAdjusterOptions opt_ba;
   TriangulatorOptions opt_triangulator;
+  GlobalPnPOptions opt_pnp;
 
   // Inlier thresholds for each component
   InlierThresholdOptions inlier_thresholds;
@@ -29,6 +31,8 @@ struct GlobalMapperOptions {
   // Control the number of iterations for each component
   int num_iteration_bundle_adjustment = 3;
   int num_iteration_retriangulation = 1;
+  int num_outlier_edges = 200;
+  std::string debug_output_dir;
 
   // Control the flow of the global sfm
   bool skip_preprocessing = false;
@@ -40,6 +44,7 @@ struct GlobalMapperOptions {
   bool skip_bundle_adjustment = false;
   bool skip_retriangulation = false;
   bool skip_pruning = true;
+  bool skip_global_pnp = false;
 };
 
 class GlobalMapper {
